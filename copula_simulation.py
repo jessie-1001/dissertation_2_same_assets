@@ -1,4 +1,5 @@
-# SCRIPT 03: GARCH-COPULA MODEL WITH STABILITY ENHANCEMENTS
+# =============================================================================
+# SCRIPT 03: GARCH-COPULA MODEL WITH STABILITY ENHANCEMENTS (改进版)
 # =============================================================================
 import pandas as pd
 import numpy as np
@@ -11,15 +12,18 @@ from scipy.optimize import minimize
 import pickle
 from scipy import stats
 from joblib import Parallel, delayed
+import statsmodels.api as sm
 
 warnings.filterwarnings('ignore')
 
 # 1. STABLE COPULA SAMPLERS
-def calc_min_var_weights(vol_spx, vol_dax, rho):
+def calc_min_var_weights(vol_spx, vol_dax, rho, smoother=None):
     var_spx, var_dax = vol_spx**2, vol_dax**2
     cov = rho * vol_spx * vol_dax
     w_spx = (var_dax - cov) / (var_spx + var_dax - 2 * cov)
-    w_spx = np.clip(w_spx, 0.2, 0.8)
+    if smoother is not None:
+        w_spx = smoother.smooth(w_spx)
+    w_spx = np.clip(w_spx, 0.3, 0.7)
     return w_spx, 1 - w_spx
 
 def sample_gaussian_copula(n_samples, corr_matrix):
@@ -72,7 +76,7 @@ def sample_survival_gumbel_copula(n_samples, theta):
 def sample_survival_clayton_copula(n_samples, theta):
     return 1 - sample_clayton_copula(n_samples, theta)
 
-# 2. ROBUST PARAMETER ESTIMATION
+# 2. ROBUST PARAMETER ESTIMATION (改进的MLE估计)
 def fit_t_copula_mle(data):
     u = data.values
     kendall_tau = data.corr('kendall').iloc[0, 1]
@@ -112,32 +116,71 @@ def fit_t_copula_mle(data):
     rho_hat, df_hat = best_params
     return {'corr_matrix': np.array([[1, rho_hat], [rho_hat, 1]]), 'df': df_hat}
 
+def fit_clayton_copula(data):
+    """MLE估计Clayton Copula参数"""
+    u = data.values
+    def neg_loglik(theta):
+        # Clayton Copula密度函数
+        u1, u2 = u[:, 0], u[:, 1]
+        c = (theta + 1) * (u1 * u2) ** (-theta - 1) * \
+            (u1 ** (-theta) + u2 ** (-theta) - 1) ** (-2 - 1/theta)
+        return -np.sum(np.log(np.maximum(c, 1e-10)))
+    
+    # 使用Kendall tau作为初始值
+    kendall_tau = data.corr(method='kendall').iloc[0, 1]
+    theta0 = 2 * kendall_tau / (1 - kendall_tau) if (1 - kendall_tau) != 0 else 0.01
+    
+    # 约束优化
+    bounds = [(0.01, 20)]
+    result = minimize(neg_loglik, [theta0], method='L-BFGS-B', bounds=bounds)
+    return result.x[0] if result.success else theta0
+
+def fit_gumbel_copula(data):
+    """MLE估计Gumbel Copula参数"""
+    u = data.values
+    def neg_loglik(theta):
+        # Gumbel Copula密度函数
+        u1, u2 = u[:, 0], u[:, 1]
+        v = (-np.log(u1)) ** theta + (-np.log(u2)) ** theta
+        c = np.exp(-v ** (1/theta)) * (v ** (-2 + 2/theta)) * \
+            ((np.log(u1)*np.log(u2)) ** (theta-1)) / (u1*u2) * \
+            (1 + (theta-1)*v ** (-1/theta))
+        return -np.sum(np.log(np.maximum(c, 1e-10)))
+    
+    # 使用Kendall tau作为初始值
+    kendall_tau = data.corr(method='kendall').iloc[0, 1]
+    theta0 = 1 / (1 - kendall_tau) if (1 - kendall_tau) != 0 else 1.01
+    
+    # 约束优化
+    bounds = [(1.01, 20)]
+    result = minimize(neg_loglik, [theta0], method='L-BFGS-B', bounds=bounds)
+    return result.x[0] if result.success else theta0
+
 def get_copula_parameters(data, silent=False):
     if not silent:
-        print("Estimating dependence parameters...")
-    kendall_tau = data.corr(method='kendall').iloc[0, 1]
+        print("Estimating dependence parameters with MLE...")
+    
+    # 使用MLE代替Kendall tau转换
     pearson_corr = data.corr(method='pearson').values
-    theta_clayton = max(0.01, 2 * kendall_tau / (1 - kendall_tau)) if (1 - kendall_tau) != 0 else 0.01
-    theta_gumbel = max(1.01, 1 / (1 - kendall_tau)) if (1 - kendall_tau) != 0 else 1.01
+    
+    # 使用MLE估计所有Copula参数
     t_copula_params = fit_t_copula_mle(data)
+    clayton_theta = fit_clayton_copula(data)
+    gumbel_theta = fit_gumbel_copula(data)
+    
     params = {
         'Gaussian': {'corr_matrix': pearson_corr},
         'StudentT': t_copula_params,
-        'Gumbel': {'theta': theta_gumbel},
-        'Clayton': {'theta': theta_clayton}
+        'Gumbel': {'theta': gumbel_theta},
+        'Clayton': {'theta': clayton_theta}
     }
+    
     if not silent:
-        param_data = {
-            'Gaussian': {'ρ (Pearson)': pearson_corr[0, 1]},
-            'StudentT': {'ρ (MLE)': t_copula_params['corr_matrix'][0, 1], 'ν (DoF, MLE)': t_copula_params['df']},
-            'Gumbel': {'θ (from Kendall)': theta_gumbel},
-            'Clayton': {'θ (from Kendall)': theta_clayton}
-        }
-        param_df = pd.DataFrame(param_data).T.fillna('')
-        print("\n\n" + "=" * 80)
-        print(">>> OUTPUT FOR DISSERTATION: TABLE 4.4 <<<")
-        print(param_df.to_markdown(floatfmt=".4f"))
-        print("=" * 80 + "\n")
+        print("\nMLE Copula Parameters:")
+        print(f"  Student-t: ρ = {t_copula_params['corr_matrix'][0,1]:.4f}, ν = {t_copula_params['df']:.2f}")
+        print(f"  Clayton: θ = {clayton_theta:.4f}")
+        print(f"  Gumbel: θ = {gumbel_theta:.4f}")
+        
     return params
 
 # 3. STABLE GARCH MODELING
@@ -183,7 +226,21 @@ def fit_garch_model(returns, model_type, max_retries=3):
                 return FallbackResult(hist_vol)
     return None
 
-def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=50000):
+# 权重平滑器
+class WeightSmoother:
+    def __init__(self, alpha=0.85, min_weight=0.3, max_weight=0.7):
+        self.alpha = alpha
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+        self.prev_weight = 0.5
+    
+    def smooth(self, new_weight):
+        smoothed = self.alpha * self.prev_weight + (1 - self.alpha) * new_weight
+        smoothed = np.clip(smoothed, self.min_weight, self.max_weight)
+        self.prev_weight = smoothed
+        return smoothed
+
+def run_simulation_for_day(t_index, full_data, copula_params, spx_smoother, dax_smoother, n_simulations=50000):
     window_data = full_data.loc[:t_index]
     res_spx = fit_garch_model(window_data['SPX_Return'].values * 100, "SPX")
     res_dax = fit_garch_model(window_data['DAX_Return'].values * 100, "DAX")
@@ -198,7 +255,7 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=5000
         print(f"DAX volatility forecast failed: {e}. Using last conditional vol.")
         sigma_t1_dax = res_dax.conditional_volatility[-1]
     rho_today = copula_params['Gaussian']['corr_matrix'][0, 1]
-    weight_spx, weight_dax = calc_min_var_weights(sigma_t1_spx, sigma_t1_dax, rho_today)
+    weight_spx, weight_dax = calc_min_var_weights(sigma_t1_spx, sigma_t1_dax, rho_today, spx_smoother)
     mu_spx_next = 0
     mu_dax_next = 0
     daily_forecasts = {}
@@ -255,9 +312,9 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=5000
             }
     return daily_forecasts
 
-def _one_day(day, full_data, copula_params):
+def _one_day(day, full_data, copula_params, spx_smoother, dax_smoother):
     t_idx = full_data.index[full_data.index.get_loc(day) - 1]
-    forecasts = run_simulation_for_day(t_idx, full_data, copula_params, n_simulations=50000)
+    forecasts = run_simulation_for_day(t_idx, full_data, copula_params, spx_smoother, dax_smoother, n_simulations=50000)
     flat = {'Date': day}
     for model, vals in forecasts.items():
         flat[f'{model}_VaR_99'] = vals['VaR_99']
@@ -272,7 +329,7 @@ def _one_day(day, full_data, copula_params):
 if __name__ == '__main__':
     try:
         print("\n" + "=" * 80)
-        print(">>> GARCH-COPULA MODEL FOR SPX & DAX <<<")
+        print(">>> GARCH-COPULA MODEL FOR SPX & DAX (改进版) <<<")
         copula_input_data = pd.read_csv('copula_input_data.csv', index_col='Date', parse_dates=True).dropna()
         full_data = pd.read_csv('spx_dax_daily_data.csv', index_col='Date', parse_dates=True)
         print("Estimating copula parameters using in-sample data...")
@@ -280,17 +337,22 @@ if __name__ == '__main__':
         print("Copula parameters estimation complete.\n")
         out_of_sample_start = '2020-01-01'
         forecast_dates = full_data.loc[out_of_sample_start:].index
+        
+        # 初始化权重平滑器
+        spx_smoother = WeightSmoother(alpha=0.85)
+        dax_smoother = WeightSmoother(alpha=0.85)
+        
         print(f"Out-of-sample period: {out_of_sample_start} to {forecast_dates[-1].date()}")
         print(f"Number of forecast days: {len(forecast_dates)}\n")
         all_forecasts = Parallel(n_jobs=8, prefer="processes")(
-            delayed(_one_day)(d, full_data, copula_params) for d in tqdm(forecast_dates, desc="Forecasting VaR/ES"))
+            delayed(_one_day)(d, full_data, copula_params, spx_smoother, dax_smoother) for d in tqdm(forecast_dates, desc="Forecasting VaR/ES"))
         forecasts_df = pd.DataFrame(all_forecasts).set_index('Date')
-        forecast_output_file = 'garch_copula_forecasts.csv'
+        forecast_output_file = 'garch_copula_forecasts_improved.csv'
         forecasts_df.to_csv(forecast_output_file)
         print(f"\nAll forecasts saved to '{forecast_output_file}'.")
-        with open('copula_params.pkl', 'wb') as f:
+        with open('copula_params_improved.pkl', 'wb') as f:
             pickle.dump(copula_params, f)
-        print("Copula parameters saved to 'copula_params.pkl'.")
+        print("Copula parameters saved to 'copula_params_improved.pkl'.")
     except Exception as e:
         print(f"An error occurred: {e}")
         import traceback
