@@ -1,5 +1,0 @@
-Model,VaR Breaches,Kupiec p-val,Christoffersen p-val,ES t-stat,ES p-val,ES Result
-Gaussian,13 (Exp: 13.4),0.9099507080803069,0.1127469055534085,,,Insufficient Data
-StudentT,13 (Exp: 13.4),0.9099507080803069,0.1127469055534085,,,Insufficient Data
-Gumbel,93 (Exp: 13.4),0.0,0.0330159105625486,4.3200405484295406,3.9368272596683426e-05,Reject
-Clayton,18 (Exp: 13.4),0.23123542986130452,0.23856178644885162,,,Insufficient Data

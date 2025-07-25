@@ -90,8 +90,8 @@ def data_processing_and_summary():
     
     # 5.1 Extreme value detection
     print("\n--- Extreme Value Detection ---")
-    extreme_spx = final_data[(final_data['SPX_Return'] < -0.05) | (final_data['SPX_Return'] > 0.05)]
-    extreme_dax = final_data[(final_data['DAX_Return'] < -0.05) | (final_data['DAX_Return'] > 0.05)]
+    extreme_spx = final_data[(final_data['SPX_Return'] < -5) | (final_data['SPX_Return'] > 5)]
+    extreme_dax = final_data[(final_data['DAX_Return'] < -5) | (final_data['DAX_Return'] > 5)]
     
     print(f"SPX extreme returns (<-5% or >5%): {len(extreme_spx)} events")
     print(f"DAX extreme returns (<-5% or >5%): {len(extreme_dax)} events")
