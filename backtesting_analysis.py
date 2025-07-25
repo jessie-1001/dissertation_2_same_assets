@@ -27,81 +27,186 @@ mpl.rcParams['axes.unicode_minus'] = False
 mpl.rcParams['figure.dpi'] = 100
 
 # -----------------------------------------------------------------------------
-# 1. STATISTICAL BACKTESTING FUNCTIONS
+# 1. STATISTICAL BACKTESTING FUNCTIONS (IMPROVED)
 # -----------------------------------------------------------------------------
 
 def kupiec_pof_test(hits, alpha=0.01):
+    """Improved Kupiec POF test with edge case handling"""
     n = len(hits)
+    if n == 0:
+        return 0, np.nan, 1.0, np.nan
+    
     n1 = hits.sum()
-    if n == 0: return 0, np.nan, 1.0
     p = alpha
     pi_hat = n1 / n
-    if n1 == 0 or np.isclose(pi_hat, 0):
-        log_lr = -2 * (n * np.log(1 - p))
-    elif np.isclose(pi_hat, 1.0):
-        log_lr = -2 * (n * np.log(p))
+    
+    # Calculate unconditional coverage statistic
+    if n1 == 0:
+        log_lr = -2 * n * np.log(1 - p)
+    elif n1 == n:
+        log_lr = -2 * n * np.log(p)
     else:
         log_lr = 2 * (n1 * np.log(pi_hat / p) + (n - n1) * np.log((1 - pi_hat) / (1 - p)))
+    
     p_value = 1 - stats.chi2.cdf(log_lr, df=1)
-    return n1, log_lr, p_value
+    return n1, log_lr, p_value, pi_hat
 
 def christoffersen_test(hits):
-    n00, n01, n10, n11 = 0, 0, 0, 0
-    for i in range(1, len(hits)):
-        if hits.iloc[i-1] == 0 and hits.iloc[i] == 0: n00 += 1
-        elif hits.iloc[i-1] == 0 and hits.iloc[i] == 1: n01 += 1
-        elif hits.iloc[i-1] == 1 and hits.iloc[i] == 0: n10 += 1
-        elif hits.iloc[i-1] == 1 and hits.iloc[i] == 1: n11 += 1
-    if (n00 + n01 + n10 + n11) == 0: return np.nan, np.nan
+    """Improved Christoffersen test with edge case handling"""
+    if len(hits) < 2:
+        return np.nan, np.nan
+    
+    transitions = pd.DataFrame({
+        'prev': hits.shift(1).dropna(),
+        'curr': hits.iloc[1:]
+    })
+    
+    # Count transitions
+    transition_counts = transitions.groupby(['prev', 'curr']).size()
+    
+    # Extract counts with default zeros
+    n00 = transition_counts.get((0, 0), 0)
+    n01 = transition_counts.get((0, 1), 0)
+    n10 = transition_counts.get((1, 0), 0)
+    n11 = transition_counts.get((1, 1), 0)
+    
+    # Calculate conditional probabilities
     pi0 = n01 / (n00 + n01) if (n00 + n01) > 0 else 0
     pi1 = n11 / (n10 + n11) if (n10 + n11) > 0 else 0
     pi = (n01 + n11) / (n00 + n01 + n10 + n11)
-    if np.isclose(pi, 0) or np.isclose(pi, 1): return np.nan, np.nan
+    
+    # Avoid division by zero and log(0)
+    if pi <= 0 or pi >= 1:
+        return np.nan, np.nan
+    
+    # Log-likelihoods
     log_L0 = (n00 + n10) * np.log(1 - pi) + (n01 + n11) * np.log(pi)
     log_L1 = 0
-    if pi0 > 0 and pi0 < 1: log_L1 += n00 * np.log(1 - pi0) + n01 * np.log(pi0)
-    if pi1 > 0 and pi1 < 1: log_L1 += n10 * np.log(1 - pi1) + n11 * np.log(pi1)
-    if np.isinf(log_L1): return np.nan, np.nan
+    
+    if pi0 > 0 and pi0 < 1:
+        log_L1 += n00 * np.log(1 - pi0) + n01 * np.log(pi0)
+    if pi1 > 0 and pi1 < 1:
+        log_L1 += n10 * np.log(1 - pi1) + n11 * np.log(pi1)
+    
+    if np.isinf(log_L1) or np.isinf(log_L0):
+        return np.nan, np.nan
+    
+    # Likelihood ratio test
     stat = -2 * (log_L0 - log_L1)
-    pval = 1 - stats.chi2.cdf(stat, df=1)
+    pval = 1 - stats.chi2.cdf(stat, df=1) if not np.isnan(stat) else np.nan
     return stat, pval
 
-def bayer_scheule_es_test(realized, es_series, var_series):
+def es_backtest(realized, es_series, var_series):
+    """Robust ES backtest suitable for 99% VaR"""
     breaches = realized <= var_series
     n_breaches = breaches.sum()
-    if n_breaches < 20:
-        return np.nan, np.nan, "Insufficient Data"
-    exceedances = realized[breaches] / es_series[breaches] - 1
-    t_stat, p_value = stats.ttest_1samp(exceedances, 0, nan_policy='omit')
-    result = "Pass" if p_value > 0.05 else "Reject"
-    return t_stat, p_value, result
+    
+    if n_breaches < 5:
+        return np.nan, np.nan, "Insufficient breaches (<5)"
+    
+    # Calculate exceedance residuals
+    exceedances = realized[breaches] - es_series[breaches]
+    
+    # Standardized test
+    mean_exceedance = exceedances.mean()
+    std_exceedance = exceedances.std()
+    
+    if std_exceedance < 1e-6:
+        return np.nan, np.nan, "Zero variance in exceedances"
+    
+    z_score = mean_exceedance / (std_exceedance / np.sqrt(n_breaches))
+    p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
+    
+    # Result interpretation
+    if p_value > 0.05:
+        result = "Pass"
+    elif p_value > 0.01:
+        result = "Marginal"
+    else:
+        result = "Reject"
+    
+    return z_score, p_value, result
 
 # -----------------------------------------------------------------------------
-# 2. ANALYSIS AND VISUALIZATION ROUTINES
+# 2. ANALYSIS AND VISUALIZATION ROUTINES (IMPROVED)
 # -----------------------------------------------------------------------------
 
 def perform_full_backtest(forecast_df, actual_df, models, alpha=0.01):
+    """Robust backtesting function with comprehensive results"""
     results = []
+    
     for model in models:
-        weights = forecast_df[[f"{model}_Weight_SPX", f"{model}_Weight_DAX"]]
-        actual_returns_oos = actual_df.loc[weights.index]
-        realized = (actual_returns_oos[["SPX_Return", "DAX_Return"]] * weights.values).sum(axis=1)
-        var_series = forecast_df.loc[weights.index, f"{model}_VaR_99"]
-        es_series = forecast_df.loc[weights.index, f"{model}_ES_99"]
-        merged = pd.concat([realized, var_series, es_series], axis=1).dropna()
-        hits = (merged.iloc[:, 0] <= merged.iloc[:, 1]).astype(int)
-        n_breaches, _, kupiec_pval = kupiec_pof_test(hits, alpha=alpha)
+        # Check if weight columns exist
+        weight_spx_col = f"{model}_Weight_SPX"
+        weight_dax_col = f"{model}_Weight_DAX"
+        var_col = f"{model}_VaR_99"
+        es_col = f"{model}_ES_99"
+        
+        if weight_spx_col not in forecast_df or weight_dax_col not in forecast_df:
+            print(f"Warning: Weight columns for {model} not found. Skipping.")
+            continue
+        
+        # Extract necessary data
+        weights = forecast_df[[weight_spx_col, weight_dax_col]].dropna()
+        if weights.empty:
+            print(f"Warning: No weight data for {model}. Skipping.")
+            continue
+            
+        # 关键修改：日期对齐
+        # 使用shift(-1)将实际收益对齐到预测日期的后一天
+        actual_shifted = actual_df.shift(-1)
+        actual_returns_oos = actual_shifted.loc[weights.index, ["SPX_Return", "DAX_Return"]]
+        
+        if actual_returns_oos.empty:
+            print(f"Warning: No matching actual returns for {model}. Skipping.")
+            continue
+        
+        # Calculate portfolio returns
+        realized = (actual_returns_oos * weights.values).sum(axis=1)
+        
+        # Get VaR and ES forecasts
+        var_series = forecast_df.loc[weights.index, var_col]
+        es_series = forecast_df.loc[weights.index, es_col]
+        
+        # Merge and drop missing values
+        merged = pd.DataFrame({
+            'realized': realized,
+            'var': var_series,
+            'es': es_series
+        }).dropna()
+        
+        if merged.empty:
+            print(f"Warning: No valid data for {model}. Skipping.")
+            continue
+        
+        # Perform backtests
+        hits = (merged['realized'] <= merged['var']).astype(int)
+        n_breaches, _, kupiec_pval, pi_hat = kupiec_pof_test(hits, alpha=alpha)
         _, christ_pval = christoffersen_test(hits)
+        es_stat, es_pval, es_result = es_backtest(merged['realized'], merged['es'], merged['var'])
+        
+        # Expected number of breaches
         expected = len(hits) * alpha
-        es_stat, es_pval, es_result = bayer_scheule_es_test(merged.iloc[:, 0], merged.iloc[:, 2], merged.iloc[:, 1])
+        
+        # Calculate breach ratio
+        breach_ratio = n_breaches / expected if expected > 0 else np.nan
+        
+        # Format results
         results.append({
-            "Model": model, "VaR Breaches": f"{n_breaches} (Exp: {expected:.1f})",
-            "Kupiec p-val": kupiec_pval, "Christoffersen p-val": christ_pval,
-            "ES t-stat": es_stat, "ES p-val": es_pval, "ES Result": es_result,
+            "Model": model,
+            "Days": len(merged),
+            "VaR Breaches": f"{n_breaches} (Exp: {expected:.1f})",
+            "Breach Ratio": f"{breach_ratio:.2f}",
+            "Kupiec p-val": kupiec_pval,
+            "Christoffersen p-val": christ_pval,
+            "ES Z-score": es_stat,
+            "ES Result": es_result,
         })
+    
     return pd.DataFrame(results)
 
 def plot_dependence_structure(data, period_range=None, period_name="Full Sample", file_suffix=""):
+    """Robust dependence plotting with enhanced error handling"""
     data = data.sort_index()
 
     if period_range:
@@ -111,33 +216,48 @@ def plot_dependence_structure(data, period_range=None, period_name="Full Sample"
         sub_data = data
         
     print(f"Plotting dependence for '{period_name}' with {len(sub_data)} data points.")
+    
     if sub_data.empty:
         print(f"--> WARNING: No data available for {period_name}. Skipping plot.")
         return
-
+    
+    # Check if we have the required columns
+    if 'u_spx' not in sub_data or 'u_dax' not in sub_data:
+        print(f"--> ERROR: Required columns 'u_spx' or 'u_dax' missing. Skipping plot.")
+        return
+    
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     fig.suptitle(f"Dependence Structure: {period_name} ({len(sub_data)} days)", fontsize=16)
-    u_spx, u_dax = sub_data['u_spx'], sub_data['u_dax']
-    hb = axes[0].hexbin(u_spx, u_dax, gridsize=30, cmap='viridis', mincnt=1)
-    fig.colorbar(hb, ax=axes[0], label='Data Point Density')
-    axes[0].set_title("Joint Distribution of PITs")
-    axes[0].set_xlabel("SPX PIT")
-    axes[0].set_ylabel("DAX PIT")
-    axes[0].set_aspect('equal', adjustable='box')
-    axes[1].scatter(u_spx, u_dax, alpha=0.3, s=10, color='red')
-    axes[1].set_title("Lower Tail Dependence (Zoomed)")
-    axes[1].set_xlabel("SPX PIT")
-    axes[1].set_ylabel("DAX PIT")
-    axes[1].set_xlim(0, 0.1)
-    axes[1].set_ylim(0, 0.1)
-    axes[1].set_aspect('equal', adjustable='box')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(f"dependence_structure_{file_suffix}.png", dpi=300)
-    plt.close()
-    print(f"--> Saved dependence plot: dependence_structure_{file_suffix}.png")
+    
+    try:
+        u_spx, u_dax = sub_data['u_spx'], sub_data['u_dax']
+        
+        # Plot 1: Joint distribution
+        hb = axes[0].hexbin(u_spx, u_dax, gridsize=30, cmap='viridis', mincnt=1)
+        fig.colorbar(hb, ax=axes[0], label='Data Point Density')
+        axes[0].set_title("Joint Distribution of PITs")
+        axes[0].set_xlabel("SPX PIT")
+        axes[0].set_ylabel("DAX PIT")
+        axes[0].set_aspect('equal', adjustable='box')
+        
+        # Plot 2: Lower tail dependence
+        axes[1].scatter(u_spx, u_dax, alpha=0.3, s=10, color='red')
+        axes[1].set_title("Lower Tail Dependence (Zoomed)")
+        axes[1].set_xlabel("SPX PIT")
+        axes[1].set_ylabel("DAX PIT")
+        axes[1].set_xlim(0, 0.1)
+        axes[1].set_ylim(0, 0.1)
+        axes[1].set_aspect('equal', adjustable='box')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(f"dependence_structure_{file_suffix}.png", dpi=300)
+        plt.close()
+        print(f"--> Saved dependence plot: dependence_structure_{file_suffix}.png")
+    except Exception as e:
+        print(f"--> ERROR plotting dependence: {str(e)}")
 
 # -----------------------------------------------------------------------------
-# 3. MAIN EXECUTION BLOCK
+# 3. MAIN EXECUTION BLOCK (IMPROVED)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n" + "="*80)
@@ -145,29 +265,47 @@ if __name__ == "__main__":
     
     try:
         print("\nLoading data files...")
-        forecast_df = pd.read_csv("garch_copula_forecasts_improved.csv", index_col='Date', parse_dates=True)
+        
+        # Load main and robustness forecasts
+        main_forecast = pd.read_csv('garch_copula_main_results.csv', index_col='Date', parse_dates=True)
+        robustness_forecast = pd.read_csv('garch_copula_robustness.csv', index_col='Date', parse_dates=True)
+        
+        # Combine forecasts
+        forecast_df = pd.concat([main_forecast, robustness_forecast], axis=1)
+        
+        # Load other data
         actual_df = pd.read_csv("spx_dax_daily_data.csv", index_col='Date', parse_dates=True)
         copula_data_for_viz = pd.read_csv('copula_input_data_full.csv', index_col='Date', parse_dates=True)
 
-        # <<< FIX: Correctly convert index to datetime and then remove timezone >>>
-        forecast_df.index = pd.to_datetime(forecast_df.index).tz_localize(None)
-        actual_df.index = pd.to_datetime(actual_df.index).tz_localize(None)
-        copula_data_for_viz.index = pd.to_datetime(copula_data_for_viz.index).tz_localize(None)
+        # Ensure indices are timezone-naive
+        for df in [forecast_df, actual_df, copula_data_for_viz]:
+            df.index = pd.to_datetime(df.index).tz_localize(None)
 
         print("Data loading complete.")
-        print(f"  Forecasts loaded: {len(forecast_df)} days")
+        print(f"  Main forecasts loaded: {len(main_forecast)} days")
+        print(f"  Robustness forecasts loaded: {len(robustness_forecast)} days")
         print(f"  Actual returns loaded: {len(actual_df)} days")
         print(f"  PIT data for visualization loaded: {len(copula_data_for_viz)} days")
 
     except FileNotFoundError as e:
-        print(f"\n[ERROR] File not found: {e.filename}. Please run previous scripts first.")
+        print(f"\n[ERROR] File not found: {e}. Please run previous scripts first.")
         exit()
 
     print("\n" + "-"*80)
     print(">>> VaR and ES Backtesting Summary <<<")
     models_to_test = ["Gaussian", "StudentT", "Gumbel", "Clayton"]
     summary_table = perform_full_backtest(forecast_df, actual_df, models_to_test)
-    print(summary_table.to_markdown(index=False, floatfmt=".4f"))
+    
+    # Format for better readability
+    formatted_table = summary_table.copy()
+    formatted_table['Kupiec p-val'] = formatted_table['Kupiec p-val'].apply(
+        lambda x: f"{x:.4f}" if not pd.isna(x) else "N/A")
+    formatted_table['Christoffersen p-val'] = formatted_table['Christoffersen p-val'].apply(
+        lambda x: f"{x:.4f}" if not pd.isna(x) else "N/A")
+    formatted_table['ES Z-score'] = formatted_table['ES Z-score'].apply(
+        lambda x: f"{x:.2f}" if not pd.isna(x) else "N/A")
+    
+    print(formatted_table.to_markdown(index=False))
     summary_table.to_csv("backtesting_summary_final.csv", index=False)
     print("\nBacktesting summary saved to 'backtesting_summary_final.csv'.")
     print("-" * 80)
@@ -176,44 +314,78 @@ if __name__ == "__main__":
     print(">>> Generating Dependence Structure Visualizations <<<")
     crisis_periods = {
         "COVID-19 Crash": ("2020-02-19", "2020-04-07"),
-        "2023 Banking Crisis": ("2023-03-08", "2023-03-24")
+        "2023 Banking Crisis": ("2023-03-08", "2023-03-24"),
+        "Full Out-of-Sample": (forecast_df.index[0].strftime('%Y-%m-%d'), 
+                              forecast_df.index[-1].strftime('%Y-%m-%d'))
     }
     
-    oos_indices = forecast_df.index.intersection(copula_data_for_viz.index)
-    plot_dependence_structure(copula_data_for_viz.loc[oos_indices], 
-                              period_name="Full Out-of-Sample Period", 
-                              file_suffix="full_oos")
-
-    for name, period in crisis_periods.items():
-        plot_dependence_structure(copula_data_for_viz, 
-                                  period_range=period, 
-                                  period_name=name, 
-                                  file_suffix=name.lower().replace(" ", "_"))
+    # Ensure we have PIT data for visualization
+    if 'u_spx' not in copula_data_for_viz or 'u_dax' not in copula_data_for_viz:
+        print("WARNING: Required PIT columns 'u_spx' or 'u_dax' missing. Skipping dependence plots.")
+    else:
+        for name, period in crisis_periods.items():
+            plot_dependence_structure(
+                copula_data_for_viz, 
+                period_range=period, 
+                period_name=name, 
+                file_suffix=name.lower().replace(" ", "_")
+            )
     print("-" * 80)
 
     best_model = 'StudentT'
     print(f"\n>>> Generating VaR Breach Plot for '{best_model}' Model <<<")
     
-    weights = forecast_df[[f"{best_model}_Weight_SPX", f"{best_model}_Weight_DAX"]]
-    actual_returns_oos = actual_df.loc[weights.index]
-    realized_returns = (actual_returns_oos[["SPX_Return", "DAX_Return"]] * weights.values).sum(axis=1)
-    var_series = forecast_df.loc[weights.index, f"{best_model}_VaR_99"]
-    merged = pd.concat([realized_returns, var_series], axis=1).dropna()
-    breaches = merged.iloc[:, 0] <= merged.iloc[:, 1]
-    
-    plt.figure(figsize=(15, 7))
-    plt.plot(merged.index, merged.iloc[:, 0], label='Portfolio Realized Return', color='gray', alpha=0.7, linewidth=1)
-    plt.plot(merged.index, merged.iloc[:, 1], label=f'{best_model} 99% VaR Forecast', color='blue', linestyle='--', linewidth=1.5)
-    plt.scatter(merged.index[breaches], merged.iloc[:, 0][breaches], color='red', s=50, zorder=5, label=f'VaR Breaches ({breaches.sum()})')
-    plt.title(f'VaR Backtest for {best_model}-Copula Model', fontsize=16)
-    plt.ylabel('Portfolio Return (%)')
-    plt.xlabel('Date')
-    plt.legend()
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-    plt.tight_layout()
-    plt.savefig("var_breach_plot.png")
-    plt.close()
-    print("--> VaR breach plot saved to 'var_breach_plot.png'.")
+    # Check for required columns
+    weight_cols = [f"{best_model}_Weight_SPX", f"{best_model}_Weight_DAX"]
+    if not all(col in forecast_df for col in weight_cols):
+        print(f"Error: Weight columns for {best_model} not found. Skipping plot.")
+    elif f"{best_model}_VaR_99" not in forecast_df:
+        print(f"Error: VaR column for {best_model} not found. Skipping plot.")
+    else:
+        weights = forecast_df[weight_cols]
+        
+        # 关键修改：日期对齐
+        # 使用shift(-1)将实际收益对齐到预测日期的后一天
+        actual_shifted = actual_df.shift(-1)
+        actual_returns_oos = actual_shifted.loc[weights.index, ["SPX_Return", "DAX_Return"]]
+        realized_returns = (actual_returns_oos * weights.values).sum(axis=1)
+        
+        var_series = forecast_df[f"{best_model}_VaR_99"]
+        
+        # Merge and clean data
+        merged = pd.DataFrame({
+            'realized': realized_returns,
+            'var': var_series
+        }).dropna()
+        
+        if merged.empty:
+            print("Error: No valid data for plotting. Skipping.")
+        else:
+            breaches = merged['realized'] <= merged['var']
+            
+            plt.figure(figsize=(15, 7))
+            plt.plot(merged.index, merged['realized'], 
+                     label='Portfolio Realized Return', 
+                     color='gray', alpha=0.7, linewidth=1)
+            plt.plot(merged.index, merged['var'], 
+                     label=f'{best_model} 99% VaR Forecast', 
+                     color='blue', linestyle='--', linewidth=1.5)
+            
+            # Plot breaches
+            breach_points = merged[breaches]
+            plt.scatter(breach_points.index, breach_points['realized'], 
+                        color='red', s=50, zorder=5, 
+                        label=f'VaR Breaches ({breaches.sum()})')
+            
+            plt.title(f'VaR Backtest for {best_model}-Copula Model', fontsize=16)
+            plt.ylabel('Portfolio Return (%)')
+            plt.xlabel('Date')
+            plt.legend()
+            plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+            plt.tight_layout()
+            plt.savefig("var_breach_plot.png", dpi=300)
+            plt.close()
+            print("--> VaR breach plot saved to 'var_breach_plot.png'.")
     
     print("\n" + "="*80)
     print(">>> SCRIPT 04 FINISHED SUCCESSFULLY <<<")
