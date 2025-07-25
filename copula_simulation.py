@@ -5,6 +5,7 @@
 # 1. Weight calculation: Use static theoretical correlation for each copula
 # 2. Quantile transformation: Gaussian uses normal dist, others use t-dist
 # 3. Archimedean copulas: Use theoretical linear correlation
+# 4. Fixed undefined variables and removed Chinese comments
 # =============================================================================
 
 import pandas as pd
@@ -25,17 +26,22 @@ warnings.filterwarnings('ignore')
 # 1. STABLE COPULA SAMPLERS AND PARAMETER ESTIMATORS
 # -----------------------------------------------------------------------------
 
-def calc_min_var_weights(vol_spx, vol_dax, rho):
-    """Calculates minimum variance portfolio weights."""
+def calc_min_var_weights(vol_spx, vol_dax, rho, leverage_effect=0):
+    """Calculates minimum variance portfolio weights with leverage adjustment"""
     var_spx, var_dax = vol_spx**2, vol_dax**2
     cov = rho * vol_spx * vol_dax
     
-    # Handle perfect correlation case
     if abs(cov - vol_spx * vol_dax) < 1e-8:
-        return (0.5, 0.5)
+        base_weights = (0.5, 0.5)
+    else:
+        w_spx = (var_dax - cov) / (var_spx + var_dax - 2 * cov)
+        base_weights = (np.clip(w_spx, 0.3, 0.7), 1 - np.clip(w_spx, 0.3, 0.7))
     
-    w_spx = (var_dax - cov) / (var_spx + var_dax - 2 * cov)
-    return np.clip(w_spx, 0.3, 0.7), 1 - np.clip(w_spx, 0.3, 0.7)
+    # Leverage effect adjustment: reduce SPX weight when leverage effect is strong
+    if leverage_effect > 1.0:  # Strong leverage effect
+        adj_w_spx = base_weights[0] * 0.9
+        return adj_w_spx, 1 - adj_w_spx
+    return base_weights
 
 def sample_gaussian_copula(n_samples, corr_matrix):
     """Generates random samples from a Gaussian copula."""
@@ -195,52 +201,76 @@ def get_copula_parameters(data):
 # 2. GARCH MODEL FITTING AND ROLLING FORECAST (FINAL FIXED VERSION)
 # -----------------------------------------------------------------------------
 
-def fit_garch_model(returns, max_retries=3):
-    """Fits a GARCH(1,1)-t model with constant mean"""
-    model = arch_model(returns, mean='Constant', vol='Garch', p=1, q=1, dist='t')
+def fit_garch_model(returns, asset_type, max_retries=3):
+    """Fits appropriate GARCH model based on asset type"""
+    if asset_type == "SPX":
+        model = arch_model(returns, mean='AR', lags=1, vol='EGARCH', p=1, o=1, q=1, dist='t')
+    else:  # DAX
+        model = arch_model(returns, mean='Constant', vol='Garch', p=1, q=1, dist='t')
     
     for attempt in range(max_retries):
         try:
             res = model.fit(disp='off', options={'maxiter': 1000})
             return res
-        except Exception:
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed for {asset_type}: {str(e)}")
             if attempt == max_retries - 1:
-                # Fallback to historical volatility
-                hist_vol = returns.std()
+                # Enhanced fallback: use EWMA volatility
+                ewma_vol = returns.ewm(span=63).std().iloc[-1]
                 class FallbackResult:
-                    def __init__(self, vol):
-                        self.params = {'mu': returns.mean(), 'nu': 5}
+                    def __init__(self, vol, mean_type='Constant'):
+                        self.params = {
+                            'mu': returns.mean() if mean_type=='Constant' else 0,
+                            'Const': returns.mean() if mean_type=='AR' else 0,
+                            'SPX_Return[1]': 0,
+                            'nu': 5
+                        }
                         self.conditional_volatility = np.full_like(returns, vol)
                     def forecast(self, horizon=1, reindex=False):
                         class VarianceForecast:
                             def __init__(self, vol): self.variance = pd.DataFrame([[vol**2]])
-                        return VarianceForecast(hist_vol)
-                return FallbackResult(hist_vol)
+                        return VarianceForecast(ewma_vol)
+                return FallbackResult(ewma_vol, 'AR' if asset_type=='SPX' else 'Constant')
     return None
 
 def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=50000):
     """Performs full simulation and risk calculation for a single day"""
-    # Use expanding window for GARCH fitting
     window_data = full_data.loc[:t_index]
     
-    # Re-fit GARCH models
-    res_spx = fit_garch_model(window_data['SPX_Return'])
-    res_dax = fit_garch_model(window_data['DAX_Return'])
+    # Use asset-specific models
+    res_spx = fit_garch_model(window_data['SPX_Return'], "SPX")
+    res_dax = fit_garch_model(window_data['DAX_Return'], "DAX")
     
-    # Forecast one-day-ahead volatility
-    sigma_t1_spx = np.sqrt(res_spx.forecast(horizon=1, reindex=False).variance.iloc[0, 0])
-    sigma_t1_dax = np.sqrt(res_dax.forecast(horizon=1, reindex=False).variance.iloc[0, 0])
+    # Forecast volatility
+    try:
+        sigma_t1_spx = np.sqrt(res_spx.forecast(horizon=1, reindex=False).variance.iloc[0, 0])
+    except:
+        sigma_t1_spx = res_spx.conditional_volatility.iloc[-1]  # Use last volatility if forecast fails
+        
+    try:
+        sigma_t1_dax = np.sqrt(res_dax.forecast(horizon=1, reindex=False).variance.iloc[0, 0])
+    except:
+        sigma_t1_dax = res_dax.conditional_volatility.iloc[-1]  # Use last volatility if forecast fails
     
-    # Forecast one-day-ahead mean
-    mu_t1_spx = res_spx.params['mu']
-    mu_t1_dax = res_dax.params['mu']
+    # Correct mean prediction - special handling for SPX's AR model
+    if 'Const' in res_spx.params and 'SPX_Return[1]' in res_spx.params:
+        mu_t1_spx = res_spx.params['Const'] + res_spx.params['SPX_Return[1]'] * window_data['SPX_Return'].iloc[-1]
+    else:
+        mu_t1_spx = res_spx.params.get('mu', 0)
+    
+    mu_t1_dax = res_dax.params.get('mu', 0)
 
-    # Get degrees of freedom from GARCH fit
+    # Get degrees of freedom
     nu_spx = res_spx.params.get('nu', 5)
     nu_dax = res_dax.params.get('nu', 5)
 
     daily_forecasts = {}
     
+    # Calculate leverage effect strength (only for SPX)
+    leverage_effect_spx = 0
+    if 'gamma[1]' in res_spx.params:
+        leverage_effect_spx = abs(res_spx.params['gamma[1]'] / res_spx.params['alpha[1]'])
+
     # Define copula samplers
     samplers = {
         'Gaussian': lambda n, p: sample_gaussian_copula(n, p['corr_matrix']),
@@ -251,16 +281,20 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=5000
     
     for name, params in copula_params.items():
         try:
-            # === CRITICAL FIX 1: Use static theoretical correlation for weights ===
+            # Get correlation for weight calculation
             rho = params['rho']
-            weight_spx, weight_dax = calc_min_var_weights(sigma_t1_spx, sigma_t1_dax, rho)
             
-            # === CRITICAL FIX 2: Simulate using copula parameters ===
+            # Calculate weights with leverage effect adjustment
+            weight_spx, weight_dax = calc_min_var_weights(
+                sigma_t1_spx, sigma_t1_dax, rho, leverage_effect_spx
+            )
+            
+            # Simulate using copula parameters
             simulated_uniforms = samplers[name](n_simulations, params)
             u_spx = np.clip(simulated_uniforms[:, 0], 1e-6, 1 - 1e-6)
             u_dax = np.clip(simulated_uniforms[:, 1], 1e-6, 1 - 1e-6)
             
-            # === CRITICAL FIX 3: Correct quantile transformation ===
+            # Correct quantile transformation
             if name == 'Gaussian':
                 # Gaussian uses normal distribution
                 z_spx = norm.ppf(u_spx)
@@ -302,6 +336,7 @@ def run_simulation_for_day(t_index, full_data, copula_params, n_simulations=5000
                 'Vol_SPX': sigma_t1_spx, 'Vol_DAX': sigma_t1_dax,
                 'Rho': rho
             }
+            
     return t_index, daily_forecasts
 
 def _one_day_wrapper(day, full_data, copula_params):
@@ -321,6 +356,7 @@ def _one_day_wrapper(day, full_data, copula_params):
         flat[f'{model}_Vol_DAX'] = vals['Vol_DAX']
         flat[f'{model}_Rho'] = vals.get('Rho', np.nan)  # Save correlation
     return flat
+
 
 # -----------------------------------------------------------------------------
 # 3. MAIN EXECUTION BLOCK
