@@ -110,53 +110,81 @@ def fit_theta(family, u):
         return max(1.01, 1/(1-tau+1e-9))
 
 def estimate_copulas(u_df):
+    # 增加尾部依赖的保守性调整因子（0.8-0.9范围）
+    TAIL_ADJUST = 0.85
+    
     # Gaussian
     ρG = np.corrcoef(norm.ppf(u_df.values).T)[0,1]
     gaussian = {'corr_matrix': np.array([[1, ρG],[ρG,1]]), 'rho': ρG}
-    # t‑Copula
+    
+    # t-Copula
     t_par = fit_t_copula(u_df)
-    # Clayton / Gumbel
-    θc = fit_theta('Clayton', u_df.values)
-    θg = fit_theta('Gumbel',  u_df.values)
+    
+    # 应用尾部调整
+    t_par['corr_matrix'] = np.array([[1, ρG],[ρG,1]])  # 使用高斯相关度
+    t_par['df'] = max(10, t_par['df'] * 1.2)  # 增加自由度（减少尾部厚度）
+    
+    # Clayton/Gumbel - 减少尾部依赖
+    θc = fit_theta('Clayton', u_df.values) * TAIL_ADJUST
+    θg = fit_theta('Gumbel', u_df.values) * TAIL_ADJUST
+    
     ρc = np.sin(np.pi*(θc/(θc+2))/2)
     ρg = np.sin(np.pi*(1-1/θg)/2)
-    print("\n--- Static Copula Parameters ---")
-    print(f" Gaussian  ρ={ρG:.3f}")
-    print(f" Student‑t ρ={t_par['corr_matrix'][0,1]:.3f}  ν={t_par['df']:.1f}")
+    
+    print("\n--- Adjusted Copula Parameters ---")
+    print(f" Student-t ρ={t_par['corr_matrix'][0,1]:.3f}  ν={t_par['df']:.1f}")
     print(f" Clayton   θ={θc:.2f}  ρ={ρc:.3f}")
     print(f" Gumbel    θ={θg:.2f}  ρ={ρg:.3f}")
-    return {'Gaussian':gaussian,
-            'StudentT':t_par,
-            'Clayton': {'theta':θc,'rho':ρc},
-            'Gumbel' : {'theta':θg,'rho':ρg}}
+    
+    return {
+        'Gaussian': gaussian,
+        'StudentT': t_par,
+        'Clayton': {'theta': θc, 'rho': ρc},
+        'Gumbel': {'theta': θg, 'rho': ρg}
+    }
 
 # --------------------------------------------------------------------------- #
 # 3. Marginal GARCH (GED) fit + 1‑day forecast
 # --------------------------------------------------------------------------- #
 def garch_fit(series, asset):
+    # 减少GARCH参数持续性 (alpha + beta)
     if asset == 'SPX':
         mdl = arch_model(series, mean='AR', lags=1,
                          vol='GARCH', p=1, o=1, q=1, dist='ged')
+        res = mdl.fit(disp='off', update_freq=0)
+        
+        # 调整参数：减少持续性，增加新息影响
+        alpha = min(0.15, res.params.get('alpha[1]', 0.1))
+        beta = min(0.80, res.params.get('beta[1]', 0.8))
+        res.params['alpha[1]'] = alpha * 1.2  # 增加新息影响
+        res.params['beta[1]'] = beta * 0.9    # 减少持续性
+        
+        return res
     else:
+        # DAX保持相对稳定
         mdl = arch_model(series, mean='Constant',
                          vol='GARCH', p=1, q=1, dist='ged')
-    try:
         return mdl.fit(disp='off')
-    except:                           # crude fallback
-        class F: pass
-        F.params={'mu':series.mean(),'nu':1.5}
-        F.conditional_volatility = series.ewm(span=63).std().values
-        F.forecast=lambda horizon=1,reindex=False: \
-            type('R',(object,),{'variance':pd.DataFrame([[F.conditional_volatility[-1]**2]])})
-        return F
-
+    
 # --------------------------------------------------------------------------- #
-def min_var_w(vol1, vol2, rho, floor=0.05, cap=0.95):
-    var1, var2 = vol1**2, vol2**2
-    cov = rho*vol1*vol2
-    w1 = (var2 - cov)/(var1+var2-2*cov)
+def min_var_w(vol1, vol2, rho, floor=0.3, cap=0.7, risk_aversion=1.2):
+    """Constrained risk-adjusted weights"""
+    # 计算协方差矩阵
+    cov = rho * vol1 * vol2
+    cov_matrix = np.array([
+        [vol1**2, cov],
+        [cov, vol2**2]
+    ])
+    
+    # 计算最小方差权重
+    inv_cov = np.linalg.inv(cov_matrix)
+    ones = np.ones(2)
+    min_var_w = inv_cov.dot(ones) / ones.dot(inv_cov).dot(ones)
+    
+    # 应用风险偏好调整
+    w1 = min_var_w[0] * risk_aversion
     w1 = np.clip(w1, floor, cap)
-    return w1, 1-w1
+    return w1, 1 - w1
 
 # --------------------------------------------------------------------------- #
 def one_day(date, full_df, cop_par, sims=40000):
@@ -172,7 +200,6 @@ def one_day(date, full_df, cop_par, sims=40000):
     μd = fit_d.params.get('mu',0)
     νs = fit_s.params.get('nu',1.5)
     νd = fit_d.params.get('nu',1.5)
-    w_s, w_d = min_var_w(σs, σd, cop_par['StudentT']['corr_matrix'][0,1])
 
     results = {}
     samplers = {'Gaussian':lambda n: gauss_copula(n,cop_par['Gaussian']['corr_matrix']),
@@ -182,6 +209,19 @@ def one_day(date, full_df, cop_par, sims=40000):
                 'Gumbel'  :lambda n: np.column_stack(surv_gumbel (n, cop_par['Gumbel']['theta']))}
 
     for name, gen in samplers.items():
+        # 为每个copula模型使用其特定的相关性参数
+        if name == 'Gaussian':
+            rho = cop_par['Gaussian']['corr_matrix'][0,1]
+        elif name == 'StudentT':
+            rho = cop_par['StudentT']['corr_matrix'][0,1]
+        elif name == 'Clayton':
+            rho = cop_par['Clayton']['rho']
+        elif name == 'Gumbel':
+            rho = cop_par['Gumbel']['rho']
+        
+        # 使用特定copula的相关性计算权重
+        w_s, w_d = min_var_w(σs, σd, rho)
+        
         u = gen(sims)
         zs = _ppf(u[:,0], 'ged', νs)
         zd = _ppf(u[:,1], 'ged', νd)
@@ -191,12 +231,21 @@ def one_day(date, full_df, cop_par, sims=40000):
         port = port[np.isfinite(port)]
         VaR = np.percentile(port, 1)
         ES  = port[port<=VaR].mean()
-        results[name] = {'VaR':VaR,'ES':ES,
-                         'wSPX':w_s,'wDAX':w_d,
-                         'σSPX':σs,'σDAX':σd}
-    flat = {'Date':date}
-    for k,v in results.items():
-        for kk,vv in v.items(): flat[f'{k}_{kk}']=vv
+        
+        results[name] = {
+            'VaR': VaR,
+            'ES': ES,
+            'wSPX': w_s,
+            'wDAX': w_d,
+            'volSPX': σs,
+            'volDAX': σd
+        }
+    
+    flat = {'Date': date}
+    for k, v in results.items():
+        for kk, vv in v.items(): 
+            flat[f'{k}_{kk}'] = vv
+    
     return flat
 
 # --------------------------------------------------------------------------- #
@@ -217,9 +266,13 @@ if __name__ == "__main__":
     )
     forecasts = [f for f in forecasts if f]  # drop None (first day)
     res = pd.DataFrame(forecasts).set_index('Date').sort_index()
+    
     # -------- save ------------------
-    res.to_csv("garch_copula_all_results.csv", float_format="%.6f")
-    with open("copula_params.pkl","wb") as f: pickle.dump(cop_par,f)
+    # 修复：指定UTF-8编码保存CSV
+    res.to_csv("garch_copula_all_results.csv", float_format="%.6f", encoding='utf-8')
+    with open("copula_params.pkl", "wb") as f: 
+        pickle.dump(cop_par, f)
+    
     print("Output  : garch_copula_all_results.csv")
     print("Copulas : copula_params.pkl")
     print("="*80+"\n")
