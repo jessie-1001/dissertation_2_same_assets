@@ -98,8 +98,7 @@ def data_processing_and_summary():
     
     # 5.2 Data continuity check
     print("\n--- Data Continuity Check ---")
-    trading_days = final_data.asfreq('B').index
-    date_diff = trading_days.to_series().diff().dt.days
+    date_diff = final_data.index.to_series().diff().dt.days
     gap_days = date_diff[date_diff > 3]  # Ignore weekends
         
     if not gap_days.empty:
