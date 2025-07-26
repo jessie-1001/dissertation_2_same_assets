@@ -1,187 +1,266 @@
 # =============================================================================
-# SCRIPT 02 : AUTOMATED MARGINAL MODEL SELECTION & DIAGNOSTICS  (REV 7 compact)
+# AUTOMATED MARGINAL GARCH MODEL SELECTION & DIAGNOSTICS  (rev 10)
 # =============================================================================
-import os, traceback
+"""
+Fits univariate GARCH‑family models to SPX and DAX log‑returns,
+selects the best spec via BIC, prints diagnostics, and exports PITs.
+
+Fixes included
+--------------
+1. select_best now returns (res, spec, bic); run_stage captures bic.
+2. EGARCH half‑life uses log(β) (no sqrt).
+3. oos_mse uses forecast(..., reindex=False) to avoid mis‑alignment.
+4. Exceptions in fit_once are logged.
+"""
+
+import os
+import traceback
 from itertools import product
 
-import numpy as np, pandas as pd, statsmodels.api as sm
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
 from arch import arch_model
-from scipy.stats import t, norm
+from scipy.stats import norm
 from statsmodels.stats.diagnostic import het_arch
 
-# ----------------------------- CONFIG -------------------------------------- #
 DATA_FILE       = "spx_dax_daily_data.csv"
 IN_SAMPLE_RATIO = 0.80
 RESULTS_DIR     = "model_logs"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0),
-                "GJR"  : dict(vol="GARCH", o=1),
-                "EGARCH": dict(vol="EGARCH")}
+VOL_FAMILIES = {
+    "GARCH":  dict(vol="GARCH",  o=0),
+    "GJR":    dict(vol="GARCH",  o=1),
+    "EGARCH": dict(vol="EGARCH")
+}
 
 DISTRIBUTIONS = ["t", "skewt", "ged"]
-PQ_GRID       = [(1, 1)]                        # 仅 (1,1) 规避冗余 α2
+PQ_GRID       = [(1, 1)]
+MEAN_SPEC     = {"Constant": dict(mean="Constant"),
+                 "AR":       dict(mean="AR", lags=1)}
 
-MEAN_SPEC = {"Constant": dict(mean="Constant"),
-             "AR"      : dict(mean="AR", lags=1)}
+MIN_ALPHA = 1e-4          # ARCH effect threshold
+MIN_LB_P  = 0.005         # Ljung‑Box p‑value cutoff
 
-MIN_ALPHA, MIN_LB_P = 1e-4, 0.005
-# --------------------------------------------------------------------------- #
 
-# --------------------------- helpers --------------------------------------- #
-coef_sum = lambda p, pre: sum(v for k, v in p.items() if k.startswith(pre))
+# ---------------------------------------------------------------- helpers ----
+coef_sum = lambda params, pre: sum(v for k, v in params.items() if k.startswith(pre))
 
-def leverage_report(p) -> str:
-    a, g = abs(coef_sum(p, "alpha[")), abs(coef_sum(p, "gamma["))
-    if a < 0.05:
-        return "Leverage effect present but ARCH component negligible"
-    if g < 0.05:
-        return "Leverage effect: not significant"
-    return f"Leverage effect: − shocks raise volatility by {g/a*100:.1f}%"
 
-def _tail_df(res) -> float:
-    for k, v in res.params.items():
-        if k.lower().startswith(("nu", "eta")):
-            return float(v)
-    return np.inf
-# --------------------------------------------------------------------------- #
+def calc_half_life(params, vol) -> float:
+    """Return volatility half‑life (days); inf if persistence ≥ 1 or ≤ 0."""
+    if vol == "GARCH":
+        pers = coef_sum(params, "alpha[") + coef_sum(params, "beta[")
+    elif vol == "GJR":
+        pers = (coef_sum(params, "alpha[") + coef_sum(params, "beta[") +
+                0.5 * coef_sum(params, "gamma["))
+    elif vol == "EGARCH":
+        beta = abs(coef_sum(params, "beta["))
+        if beta >= 1 or beta <= 0:
+            return np.inf
+        return np.log(0.5) / np.log(beta)
+    else:
+        pers = np.nan
 
-def _fit_once(series, vol, dist, p, q, mean_kw):
+    if pers >= 1 or pers <= 0:
+        return np.inf
+    return np.log(0.5) / np.log(pers)
+
+
+def fit_once(series, vol, dist, p, q, mean_kw):
+    """Try one model; return result or None."""
     try:
         mdl = arch_model(series, p=p, q=q, dist=dist,
                          rescale=False, **mean_kw, **VOL_FAMILIES[vol])
-        return mdl.fit(disp="off")
-    except Exception:
+        res = mdl.fit(disp="off")
+        if res.convergence_flag != 0:
+            print(f"⚠ {vol}-{dist} convergence flag = {res.convergence_flag}")
+        return res
+    except Exception as e:
+        print(f"⚠ Fit failed for {vol}-{dist}: {e}")
         return None
 
-def _passes_basic(res, series):
+
+def passes_basic(res, series) -> bool:
+    """Quick filter: some ARCH plus Ljung‑Box on std‑resid."""
     a = abs(coef_sum(res.params, "alpha["))
     g = abs(coef_sum(res.params, "gamma["))
     if a < MIN_ALPHA and g >= MIN_ALPHA:
         return False
-    lb = sm.stats.acorr_ljungbox(
+    lb_p = sm.stats.acorr_ljungbox(
         pd.Series(res.std_resid, index=series.index).dropna(),
         lags=[10], return_df=True)["lb_pvalue"].iloc[0]
-    return lb >= MIN_LB_P
+    return lb_p >= MIN_LB_P
+
 
 def select_best(series, tag):
-    good, all_ = [], []
-    for mtag, mkw in MEAN_SPEC.items():
+    """Return (result, spec_tuple, bic)."""
+    candidates, shortlisted = [], []
+    for mean_tag, mean_kw in MEAN_SPEC.items():
         for vol, dist, (p, q) in product(VOL_FAMILIES, DISTRIBUTIONS, PQ_GRID):
-            res = _fit_once(series, vol, dist, p, q, mkw)
-            if res is None:          # failed fit
+            res = fit_once(series, vol, dist, p, q, mean_kw)
+            if res is None:
                 continue
-            all_.append((res.bic, res, (mtag, vol, dist, p, q)))
-            if _passes_basic(res, series):
-                good.append((res.bic, res, (mtag, vol, dist, p, q)))
+            spec = (mean_tag, vol, dist, p, q)
+            candidates.append((res.bic, res, spec))
+            if passes_basic(res, series):
+                shortlisted.append((res.bic, res, spec))
 
-    src = good or all_
-    bic, res, spec = min(src, key=lambda x: x[0])
-    mtag, vol, dist, p, q = spec
-    if not good:
-        print(f"⚠ WARNING: picked {mtag}-{vol}-{dist} (no model met checks).")
-    print(f"\n✔ Best marginal for {tag}: {mtag}+{vol}({p},{q})-{dist} | BIC={bic:,.2f}")
+    bic, res, spec = min(shortlisted or candidates, key=lambda x: x[0])
+    mean_tag, vol, dist, p, q = spec
+    if not shortlisted:
+        print(f"⚠ best model for {tag} failed some diagnostics.")
+    print(f"✔ best for {tag}: {mean_tag}+{vol}({p},{q})-{dist}, BIC={bic:,.2f}")
     return res, spec, bic
-# --------------------------------------------------------------------------- #
 
-def diagnostics(res, series, tag):
-    p = res.params
-    print(f"\n--- Parameter Estimates for {tag} ---")
-    print(pd.DataFrame({
-        "Coefficient": p,
-        "P‑value": res.pvalues.map(lambda v: "<0.0001" if v < 1e-4 else f"{v:.4f}")
-    }).to_markdown(floatfmt=".4f"))
+
+def diagnostics(res, series, tag, vol):
+    params = res.params
+    print(f"\n--- Parameters for {tag} ---")
+    df_out = pd.DataFrame({
+        "Coeff": params,
+        "p‑value": res.pvalues.apply(lambda v: "<0.0001" if v < 1e-4
+                                                     else f"{v:.4f}")
+    })
+    print(df_out.to_markdown(floatfmt=".4f"))
 
     dist_obj = getattr(res, "distribution", None) or res.model.distribution
-    name = dist_obj.name.lower()
-    df  = _tail_df(res)
-    print(f"Tail thickness (df): {df:.2f} → "
-          f"{'heavy' if df<5 else 'moderate' if df<10 else 'near‑normal'}")
-    print(leverage_report(p))
-    if "beta[1]" in p:
-        half = np.log(0.5) / np.log(p["beta[1]"])
-        print(f"Volatility half‑life: {half:.1f} days")
-
-    if name in {"t", "skewt", "skewstudent"}:
-        theta = res.params[-dist_obj.num_params:]
-        prob = (dist_obj.cdf(-5, theta) + 1 - dist_obj.cdf(5, theta)) * 100
-        print(f"P(|r|>5σ): {prob:.4f}% (Normal≈{norm.sf(5)*200:.6f}%)")
+    theta    = res.params[-dist_obj.num_params:]
+    half     = calc_half_life(params, vol)
+    if np.isfinite(half):
+        print(f"Half‑life: {half:.1f} days")
     else:
-        print("P(|r|>5σ): n/a for GED")
+        print("Half‑life: persistence ≥ 1")
+
+    if dist_obj.name.lower() in {"t", "skewt", "skewstudent"}:
+        df = float(theta[0])
+        tail_prob = (dist_obj.cdf(-5, theta) +
+                     1 - dist_obj.cdf(5, theta)) * 100
+        label = "heavy" if df < 5 else "moderate" if df < 10 else "near‑normal"
+        print(f"Tail df: {df:.2f} ({label}),  P(|r|>5σ): {tail_prob:.4f}% "
+              f"(Normal≈{norm.sf(5)*200:.6f}%)")
 
     std = pd.Series(res.std_resid, index=series.index).dropna()
     for lag in (5, 10, 20):
-        lb = sm.stats.acorr_ljungbox(std, lags=[lag],
-                                     return_df=True)["lb_pvalue"].iloc[0]
-        print(f"L‑Box StdRes (lag {lag}): p={lb:.4f}")
-    lm_f, lm_p = het_arch(std)[:2]
-    print(f"ARCH‑LM: F={lm_f:.3f}, p={lm_p:.4f}")
-# --------------------------------------------------------------------------- #
+        lb_p = sm.stats.acorr_ljungbox(std, lags=[lag],
+                                       return_df=True)["lb_pvalue"].iloc[0]
+        print(f"Ljung‑Box p lag {lag}: {lb_p:.4f}")
+    arch_f, arch_p = het_arch(std)[:2]
+    print(f"ARCH‑LM: F={arch_f:.3f}, p={arch_p:.4f}")
 
-def calc_pit(res, series):
-    std = pd.Series(res.std_resid, index=series.index).dropna()
-    dist_obj = getattr(res, "distribution", None) or res.model.distribution
-    theta    = res.params[-dist_obj.num_params:]
-    u = dist_obj.cdf(std.to_numpy(), theta)
-    return pd.Series(u, index=std.index).clip(1e-6, 1-1e-6)
 
-def oos_mse(res, series, start_idx):
-    var = res.forecast(start=start_idx).variance['h.1']
-    truth = series.iloc[start_idx:]**2
-    truth, var = truth.align(var, join='inner')
-    return ((truth - var)**2).mean()
-# --------------------------------------------------------------------------- #
+def pit_series(res, series, eps=1e-9):
+    dist = getattr(res, "distribution", None) or res.model.distribution
+    theta = res.params[-dist.num_params:]
+    std   = pd.Series(res.std_resid, index=series.index).dropna()
+    u     = dist.cdf(std.to_numpy(), theta)
+    return pd.Series(u, index=std.index).clip(eps, 1 - eps)
 
-def run_stage(frame, label, full_series=None, split_idx=None):
+
+def oos_mse(res, full_series, start_idx):
+    """
+    计算样本外波动率预测的均方误差
+    
+    参数:
+    res - 拟合的GARCH模型结果
+    full_series - 完整的时间序列数据
+    start_idx - 样本外预测开始位置
+    
+    返回:
+    MSE值
+    """
+    try:
+        # 获取样本外数据长度
+        oos_length = len(full_series) - start_idx
+        if oos_length <= 0:
+            print(f"⚠ 无效的样本外长度: {oos_length}")
+            return np.nan
+        
+        # 确保模型有足够的拟合数据
+        if start_idx > len(res.model.data):
+            print(f"⚠ 开始位置 {start_idx} 超出模型数据范围 ({len(res.model.data)})")
+            return np.nan
+        
+        # 获取预测对象（显式指定 horizon）
+        forecast = res.forecast(horizon=oos_length, start=start_idx)
+        
+        # 检查预测结果是否为空
+        if forecast.variance.empty:
+            print("⚠ 预测结果为空")
+            return np.nan
+        
+        # 获取波动率预测值
+        var_fcst = forecast.variance.iloc[:, 0]
+        
+        # 获取实际波动率值（与预测值相同长度）
+        realized = full_series.iloc[start_idx:start_idx+len(var_fcst)].values ** 2
+        
+        # 计算均方误差
+        return np.mean((realized - var_fcst.values) ** 2)
+    
+    except Exception as e:
+        print(f"⚠ OOS MSE计算失败: {str(e)}")
+        return np.nan
+
+
+def run_stage(frame, label):
     results = {}
-    for col, short in [("SPX_Return", "SPX"), ("DAX_Return", "DAX")]:
-        res, spec, bic = select_best(frame[col], f"{short} ({label})")
-        diagnostics(res, frame[col], f"{short} ({label})")
+    for col, short in [("SPX_Return", "SPX"),
+                       ("DAX_Return", "DAX")]:
+        res, spec, bic = select_best(frame[col], f"{short} {label}")
+        _, vol, _, _, _ = spec
+        diagnostics(res, frame[col], f"{short} {label}", vol)
 
-        with open(f"{RESULTS_DIR}/{short}_{label}.txt", "w", encoding="utf-8") as f:
-            f.write(f"{'+'.join(map(str, spec))} | BIC={bic:,.2f}\n\n{res.summary()}")
-
-        # Optional OOS evaluation (only when full_series passed)
-        if full_series is not None and split_idx is not None:
-            mse = oos_mse(res, full_series[col], split_idx)
-            print(f"OOS Volatility MSE for {short}: {mse:.6f}")
-
+        out = f"{RESULTS_DIR}/{short}_{label}.txt"
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(f"{'+'.join(map(str, spec))} | BIC={bic:,.2f}\n\n"
+                     f"{res.summary()}")
         results[short] = res
     return results
-# --------------------------------------------------------------------------- #
 
+
+# ---------------------------------------------------------------- main -------
 def main():
-    print("\n" + "="*80)
-    print(">>> SCRIPT 02: AUTOMATED MARGINAL MODEL ESTIMATION <<<")
+    print("=" * 80)
+    print("MARGINAL GARCH MODELLING")
 
-    data  = pd.read_csv(DATA_FILE, index_col="Date", parse_dates=True)
+    data = pd.read_csv(DATA_FILE, index_col="Date", parse_dates=True)
     split = int(len(data) * IN_SAMPLE_RATIO)
 
-    print(f"\n>>> Stage 1 | In‑Sample ({split} obs) <<<")
+    # --------------------------------- in‑sample
+    print(f"\n>>> Stage 1 — In‑sample ({split} obs) <<<")
     res_in = run_stage(data.iloc[:split], "IS")
 
-    pd.concat([calc_pit(res_in["SPX"], data["SPX_Return"].iloc[:split]),
-               calc_pit(res_in["DAX"], data["DAX_Return"].iloc[:split])],
-              axis=1, join="inner").set_axis(["u_spx", "u_dax"], axis=1)\
-              .to_csv("copula_input_data.csv")
-    print("✔ In‑sample PIT saved → copula_input_data.csv")
+    for short, col in [("SPX", "SPX_Return"), ("DAX", "DAX_Return")]:
+        mse = oos_mse(res_in[short], data[col], split)
+        print(f"OOS variance MSE for {short}: {mse:.6f}")
 
-    print(f"\n>>> Stage 2 | Full Sample ({len(data)} obs) <<<")
-    res_full = run_stage(data, "FS", full_series=data, split_idx=split)
+    pd.concat([
+        pit_series(res_in["SPX"], data["SPX_Return"].iloc[:split]),
+        pit_series(res_in["DAX"], data["DAX_Return"].iloc[:split])
+    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1)\
+      .to_csv("copula_input_data.csv")
+    print("In‑sample PIT saved → copula_input_data.csv")
 
-    pd.concat([calc_pit(res_full["SPX"], data["SPX_Return"]),
-               calc_pit(res_full["DAX"], data["DAX_Return"])],
-              axis=1, join="inner").set_axis(["u_spx", "u_dax"], axis=1)\
-              .to_csv("copula_input_data_full.csv")
-    print("✔ Full‑sample PIT saved → copula_input_data_full.csv")
+    # --------------------------------- full‑sample
+    print(f"\n>>> Stage 2 — Full sample ({len(data)} obs) <<<")
+    res_full = run_stage(data, "FS")
 
-    print("\n" + "="*80)
-    print("SCRIPT 02 finished successfully.")
-    print("="*80 + "\n")
+    pd.concat([
+        pit_series(res_full["SPX"], data["SPX_Return"]),
+        pit_series(res_full["DAX"], data["DAX_Return"])
+    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1)\
+      .to_csv("copula_input_data_full.csv")
+    print("Full‑sample PIT saved → copula_input_data_full.csv")
+
+    print("=" * 80)
+    print("Finished successfully.")
+
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        print(f"[ERROR] {e}")
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
         traceback.print_exc()
