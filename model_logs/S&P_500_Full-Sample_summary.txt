@@ -6,8 +6,8 @@ Vol Model:                           EGARCH   Log-Likelihood:               -606
 Distribution:      Standardized Student's t   AIC:                           12149.1
 Method:                  Maximum Likelihood   BIC:                           12194.0
                                               No. Observations:                 4548
-Date:                      Fri, Jul 25 2025   Df Residuals:                     4546
-Time:                              22:41:07   Df Model:                            2
+Date:                      Sat, Jul 26 2025   Df Residuals:                     4546
+Time:                              14:19:07   Df Model:                            2
                                     Mean Model                                   
 =================================================================================
                     coef    std err          t      P>|t|        95.0% Conf. Int.

@@ -6,8 +6,8 @@ Vol Model:                            GARCH   Log-Likelihood:               -701
 Distribution:      Standardized Student's t   AIC:                           14045.0
 Method:                  Maximum Likelihood   BIC:                           14077.1
                                               No. Observations:                 4549
-Date:                      Fri, Jul 25 2025   Df Residuals:                     4548
-Time:                              22:41:07   Df Model:                            1
+Date:                      Sat, Jul 26 2025   Df Residuals:                     4548
+Time:                              14:19:07   Df Model:                            1
                                 Mean Model                                
 ==========================================================================
                  coef    std err          t      P>|t|    95.0% Conf. Int.

@@ -13,8 +13,6 @@
 #   - garch_copula_robustness.csv
 #   - copula_input_data_full.csv
 #   - backtesting_summary_final.csv
-#
-# Author : <your‑name>
 # =============================================================================
 import warnings
 import pandas as pd
