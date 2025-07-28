@@ -1,4 +1,4 @@
-Constant+GARCH+ged+1+1 | BIC=14,059.76
+Constant+GARCH(1,1)-ged | BIC=14,059.76
 
                            Constant Mean - GARCH Model Results                            
 ==========================================================================================
@@ -8,8 +8,8 @@ Vol Model:                                  GARCH   Log-Likelihood:             
 Distribution:      Generalized Error Distribution   AIC:                           14027.6
 Method:                        Maximum Likelihood   BIC:                           14059.8
                                                     No. Observations:                 4549
-Date:                            Sun, Jul 27 2025   Df Residuals:                     4548
-Time:                                    00:38:14   Df Model:                            1
+Date:                            Mon, Jul 28 2025   Df Residuals:                     4548
+Time:                                    17:39:35   Df Model:                            1
                                 Mean Model                                
 ==========================================================================
                  coef    std err          t      P>|t|    95.0% Conf. Int.

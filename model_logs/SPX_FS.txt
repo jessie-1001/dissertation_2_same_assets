@@ -1,4 +1,4 @@
-AR+GJR+ged+1+1 | BIC=12,238.89
+AR+GJR(1,1)-ged | BIC=12,238.89
 
                                AR - GJR-GARCH Model Results                               
 ==========================================================================================
@@ -8,8 +8,8 @@ Vol Model:                              GJR-GARCH   Log-Likelihood:             
 Distribution:      Generalized Error Distribution   AIC:                           12193.9
 Method:                        Maximum Likelihood   BIC:                           12238.9
                                                     No. Observations:                 4548
-Date:                            Sun, Jul 27 2025   Df Residuals:                     4546
-Time:                                    00:38:13   Df Model:                            2
+Date:                            Mon, Jul 28 2025   Df Residuals:                     4546
+Time:                                    17:39:34   Df Model:                            2
                                     Mean Model                                   
 =================================================================================
                     coef    std err          t      P>|t|        95.0% Conf. Int.
