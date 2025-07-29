@@ -1,0 +1,5 @@
+Model,Obs,Breaches,Expected,BreachRate,Kupiec_p,Christ_p,ES_test,AnnRet%,AnnVol%,Sharpe,vs50/50
+Gaussian,1340,11,13.4,0.0082,0.4965,0.3774,Pass,11.92,18.93,0.63,Better
+StudentT,1340,10,13.4,0.0075,0.3284,0.3364,Pass,11.60,19.00,0.61,Better
+Clayton,1340,7,13.4,0.0052,0.0531,0.2211,Pass,11.92,18.93,0.63,Better
+Gumbel,1340,17,13.4,0.0127,0.3427,0.0053,Pass,11.92,18.93,0.63,Better

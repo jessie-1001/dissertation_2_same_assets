@@ -25,11 +25,17 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 from math import gamma
 
-# === three knobs ============================================================
-ALPHA_SCALE = 1.00     # 1 = keep alpha; >1 boost; <1 shrink
-BETA_CAP    = 0.75      # upper cap for beta -> shorter memory
-REFIT_FREQ  = 63       # re‑estimate every ~3 months
-# ============================================================================
+# === global knobs =========================================================
+ALPHA_SCALE  = 1.00        # GARCH α 放大倍数（>1 更灵敏）
+BETA_CAP     = 0.70        # GARCH β 上限（越小→记忆越短）
+REFIT_FREQ   = 63          # GARCH 重新估计频率（≈1 个季度）
+
+TAIL_ADJ     = 1.30        # Copula θ 放大（>1 加强尾依赖）
+USE_SURV     = True        # True→用 survival‑Clayton / survival‑Gumbel（上尾）
+WEIGHT_FLOOR = 0.25        # 组合最小 w_SPX
+WEIGHT_CAP   = 0.75        # 组合最大 w_SPX
+# ==========================================================================
+
 _last_idx, _cache_spx, _cache_dax = -999, None, None    # forecast cache
 # --------------------------------------------------------------------------- #
 
@@ -125,35 +131,36 @@ def _theta_from_tau(fam, u_df):
     if fam == "Gumbel":
         return max(1.01, 1 / (1 - tau + 1e-9))
 
+# --------------------------------------------------------------------------- #
+# 2. Copula parameter estimation (✱ re‑write)                                #
+# --------------------------------------------------------------------------- #
 def estimate_copulas(u_raw: pd.DataFrame):
-    """Return dict with Gaussian / t / survival‑Clayton / survival‑Gumbel."""
-    u = u_raw.dropna()          # 先清理缺失
+    """
+    输出 dict:  Gaussian / StudentT / Clayton / Gumbel
+    Clayton‧Gumbel 的 θ 乘以全局 TAIL_ADJ，可通过 USE_SURV
+    决定是否改用 survival‑copula（上尾依赖）。
+    """
+    u = u_raw.dropna()
     if u.empty:
-        raise ValueError("Input PIT series全为空，无法估计 copula 参数。")
+        raise ValueError("PIT 序列为空，无法估计 copula 参数。")
 
-    z = norm.ppf(u.clip(1e-6, 1 - 1e-6).values)
-    ρG = np.corrcoef(z.T)[0, 1]
-    if not np.isfinite(ρG):
-        ρG = 0.0                # 回退
+    z   = norm.ppf(u.clip(1e-6, 1-1e-6).values)
+    rhoG = np.corrcoef(z.T)[0, 1] if np.isfinite(z).all() else 0.0
+    gaussian = {"corr_matrix": np.array([[1, rhoG], [rhoG, 1]]), "rho": rhoG}
 
-    # Gaussian
-    gaussian = {"corr_matrix": np.array([[1, ρG], [ρG, 1]]), "rho": ρG}
-
-    # Student‑t
+    # ---- Student‑t ---------------------------------------------------------
     t_par = fit_t_copula(u)
-    t_par["df"] = min(30, t_par["df"])          #tiaocan############################################
+    t_par["df"] = min(30, t_par["df"])                      # 上限 30
 
-    # Tail copulas（使用 upper‑tail / lower‑tail 版本）
-    TAIL_ADJ = 0.95 #tiaocan############################################
+    # ---- Clayton / Gumbel --------------------------------------------------
     θc = _theta_from_tau("Clayton", u) * TAIL_ADJ
     θg = _theta_from_tau("Gumbel",  u) * TAIL_ADJ
-    ρc = np.sin(np.pi * (θc / (θc + 2)) / 2)
+    ρc = np.sin(np.pi * (θc / (θc + 2)) / 2)                # 近似 ρ
     ρg = np.sin(np.pi * (1 - 1 / θg) / 2)
-    ρT = t_par["corr_matrix"][0, 1]
 
     print("\n--- Adjusted Copula Parameters ---")
-    print(f" Gaussian   ρ = {ρG:.3f}")
-    print(f" Student‑t  ρ = {ρT:.3f}  ν = {t_par['df']:.1f}")
+    print(f" Gaussian   ρ = {rhoG:.3f}")
+    print(f" Student‑t  ρ = {t_par['corr_matrix'][0,1]:.3f}  ν = {t_par['df']:.1f}")
     print(f" Clayton    θ = {θc:.2f}  ρ ≈ {ρc:.3f}")
     print(f" Gumbel     θ = {θg:.2f}  ρ ≈ {ρg:.3f}")
 
@@ -165,77 +172,103 @@ def estimate_copulas(u_raw: pd.DataFrame):
     }
 
 # --------------------------------------------------------------------------- #
-# 3. Marginal GARCH fit
+# 3. Marginal GARCH fit (✱ re‑write)                                         #
 # --------------------------------------------------------------------------- #
 def garch_fit(series, asset):
-    if asset=="SPX":
-        mdl=arch_model(series,mean="AR",lags=1,vol="GARCH",p=1,o=1,q=1,dist="ged")
+    if asset == "SPX":
+        mdl = arch_model(series, mean="AR", lags=1,
+                         vol="GARCH", p=1, o=1, q=1, dist="ged")
     else:
-        mdl=arch_model(series,mean="Constant",vol="GARCH",p=1,q=1,dist="ged")
-    res=mdl.fit(disp="off")
-    if "alpha[1]" in res.params: res.params["alpha[1]"]*=ALPHA_SCALE
-    if "beta[1]"  in res.params: res.params["beta[1]"]=min(res.params["beta[1]"],BETA_CAP)
+        mdl = arch_model(series, mean="Constant",
+                         vol="GARCH", p=1, q=1, dist="ged")
+
+    res = mdl.fit(disp="off")
+
+    # —— 软约束：调 α、截 β ——
+    if "alpha[1]" in res.params:
+        res.params["alpha[1]"] *= ALPHA_SCALE
+    if "beta[1]" in res.params:
+        res.params["beta[1]"]  = min(res.params["beta[1]"], BETA_CAP)
     return res
 
 
-def min_var_w(vol1, vol2, rho, floor=0.2, cap=0.8):
-    cov = rho * vol1 * vol2
-    Σ   = np.array([[vol1 ** 2, cov], [cov, vol2 ** 2]])
-    inv = np.linalg.inv(Σ)
-    w   = inv @ np.ones(2) / (np.ones(2) @ inv @ np.ones(2))
-    w1  = np.clip(w[0], floor, cap)
-    return w1, 1 - w1
-
+# --------------------------------------------------------------------------- #
+# 4. Single‑day simulation block (✱ re‑write)                                #
 # --------------------------------------------------------------------------- #
 def one_day(date, full_df, cop, sims=40_000):
-    global _last_idx,_cache_spx,_cache_dax
+    global _last_idx, _cache_spx, _cache_dax
     idx = full_df.index.get_loc(date)
-    if idx==0: return None
+    if idx == 0:
+        return None
 
-    # --------- refit every REFIT_FREQ days ----------
-    if (idx-_last_idx)>=REFIT_FREQ or _cache_spx is None:
-        hist = full_df.iloc[:idx]
-        _cache_spx = garch_fit(hist["SPX_Return"],"SPX")
-        _cache_dax = garch_fit(hist["DAX_Return"],"DAX")
-        _last_idx  = idx
-    fit_s,fit_d=_cache_spx,_cache_dax                    # use cache
+    # —— 每 REFIT_FREQ 天重新估计一次 marginals ——
+    if (idx - _last_idx) >= REFIT_FREQ or _cache_spx is None:
+        hist          = full_df.iloc[:idx]
+        _cache_spx    = garch_fit(hist["SPX_Return"], "SPX")
+        _cache_dax    = garch_fit(hist["DAX_Return"], "DAX")
+        _last_idx     = idx
+    fit_s, fit_d = _cache_spx, _cache_dax
 
-    σs=np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0,0])
-    σd=np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0,0])
-    μs,μd = fit_s.params.get("mu",0), fit_d.params.get("mu",0)
-    νs,νd = fit_s.params.get("nu",1.5),fit_d.params.get("nu",1.5)
+    σs = np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0, 0])
+    σd = np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0, 0])
+    μs, μd = fit_s.params.get("mu", 0), fit_d.params.get("mu", 0)
+    νs, νd = fit_s.params.get("nu", 1.5), fit_d.params.get("nu", 1.5)
 
-    samplers={
-        "Gaussian":lambda n:gauss_copula(n,cop["Gaussian"]["corr_matrix"]),
-        "StudentT":lambda n:t_copula(n,cop["StudentT"]["corr_matrix"],cop["StudentT"]["df"]),
-        "Clayton" :lambda n:clayton_copula(n,cop["Clayton"]["theta"]),
-        "Gumbel"  :lambda n:np.column_stack(surv_gumbel(n,cop["Gumbel"]["theta"]))
+    samplers = {
+        "Gaussian": lambda n: gauss_copula(n, cop["Gaussian"]["corr_matrix"]),
+        "StudentT": lambda n: t_copula(n,
+                        cop["StudentT"]["corr_matrix"], cop["StudentT"]["df"]),
+        "Clayton" : (lambda n:
+            np.column_stack(surv_clayton(n, cop["Clayton"]["theta"]))
+            if USE_SURV else clayton_copula(n, cop["Clayton"]["theta"])),
+        "Gumbel"  : (lambda n:
+            np.column_stack(surv_gumbel(n,  cop["Gumbel"]["theta"]))
+            if USE_SURV else gumbel_copula(n,  cop["Gumbel"]["theta"]))
     }
 
-    out={}
-    for name,gen in samplers.items():
-        rho={"Gaussian":cop["Gaussian"]["rho"],
-             "StudentT":cop["StudentT"]["corr_matrix"][0,1],
-             "Clayton" :cop["Clayton"]["rho"],
-             "Gumbel"  :cop["Gumbel"]["rho"]}[name]
-        w_s,w_d=min_var_w(σs,σd,rho)
-        u=gen(sims); port=w_s*(μs+σs*_ppf(u[:,0],"ged",νs))+w_d*(μd+σd*_ppf(u[:,1],"ged",νd))
-        port=port[np.isfinite(port)]
-        if port.size<50: VaR=ES=np.nan
-        else:            VaR=np.percentile(port,1); ES=port[port<=VaR].mean()
-        out.update({f"{name}_VaR":VaR,f"{name}_ES":ES,f"{name}_wSPX":w_s,f"{name}_wDAX":w_d,
-                    f"{name}_volSPX":σs,f"{name}_volDAX":σd})
+    out = {}
+    for name, gen in samplers.items():
+        rho = {
+            "Gaussian": cop["Gaussian"]["rho"],
+            "StudentT": cop["StudentT"]["corr_matrix"][0, 1],
+            "Clayton" : cop["Clayton"]["rho"],
+            "Gumbel"  : cop["Gumbel"]["rho"],
+        }[name]
 
-    out["Date"]=date
+        w_s, w_d = min_var_w(σs, σd, rho)          # floor / cap 来自全局常量
+        u   = gen(sims)
+        port= w_s*(μs + σs*_ppf(u[:,0],"ged",νs)) + \
+              w_d*(μd + σd*_ppf(u[:,1],"ged",νd))
+        port = port[np.isfinite(port)]
+        if port.size < 50:
+            VaR = ES = np.nan
+        else:
+            VaR = np.percentile(port, 1)
+            ES  = port[port <= VaR].mean()
+
+        out.update({
+            f"{name}_VaR"   : VaR,
+            f"{name}_ES"    : ES,
+            f"{name}_wSPX"  : w_s,
+            f"{name}_wDAX"  : w_d,
+            f"{name}_volSPX": σs,
+            f"{name}_volDAX": σd
+        })
+
+    out["Date"] = date
     return out
 # --------------------------------------------------------------------------- #
 # 5 |  util for weights
 # --------------------------------------------------------------------------- #
-def min_var_w(vol1,vol2,rho,floor=0.3,cap=0.7):
-    Σ=np.array([[vol1**2,rho*vol1*vol2],[rho*vol1*vol2,vol2**2]])
-    inv=np.linalg.inv(Σ); w=inv@np.ones(2)/ (np.ones(2)@inv@np.ones(2))
-    w1=np.clip(w[0],floor,cap)
-    return w1,1-w1
+def min_var_w(vol1, vol2, rho,
+              floor=WEIGHT_FLOOR,   # ← 用全局常量
+              cap=WEIGHT_CAP):      # ← 用全局常量
+    Σ = np.array([[vol1**2, rho*vol1*vol2],
+                  [rho*vol1*vol2, vol2**2]])
+    inv = np.linalg.inv(Σ)
+    w   = inv @ np.ones(2) / (np.ones(2) @ inv @ np.ones(2))
+    w1  = np.clip(w[0], floor, cap)
+    return w1, 1 - w1
 # --------------------------------------------------------------------------- #
 if __name__=="__main__":
     print("="*80,"\n>>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST <<<")
