@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # =============================================================================
-# DATA ACQUISITION & QUALITY CHECK – SPX and DAX
+# DATA ACQUISITION & QUALITY CHECK – SPX and DAX (Leakage-Free)
 # =============================================================================
 """
-Downloads daily closes for S&P 500 (^GSPC) and DAX (^GDAXI),
-computes daily log‑returns, performs descriptive stats &
-extreme‑move detection, outputs CSV + diagnostic plots.
-
-Choose `THRESHOLD_MODE`:
-    "fixed" -> |r| > FIXED_PCT
-    "dual"  -> |r| > FIXED_PCT  OR  |r| > K_SIGMA * σ
+Downloads daily closes for S&P 500 (^GSPC) and DAX (^GDAXI),
+computes daily log-returns, performs descriptive stats &
+extreme-move detection, outputs CSV + diagnostic plots.
 """
 
 import os
@@ -34,18 +30,16 @@ OVERVIEW_PNG            = f"{PLOT_DIR}/price_return_overview.png"
 EXTREME_RETURNS_PNG     = f"{PLOT_DIR}/extreme_returns.png"
 
 THRESHOLD_MODE          = "dual"    # "fixed"  or "dual"
-FIXED_PCT               = 5         # 5  ->  ±5 %
+FIXED_PCT               = 5         # 5  ->  ±5%
 K_SIGMA                 = 3         # used when THRESHOLD_MODE="dual"
 
-SHOW_GAP_SUMMARY        = True      # list multi‑day data gaps?
+SHOW_GAP_SUMMARY        = True      # list multi-day data gaps?
 DRAW_THRESHOLD_LINES    = True      # draw ±threshold on plots?
 # ---------------------------------------------------------------------------- #
 
 os.makedirs(PLOT_DIR, exist_ok=True)
 
-
 # -----------------------------------------------------------------------------
-
 
 def download_prices() -> pd.DataFrame:
     print(f"Downloading {TICKERS} from {START_DATE} to {END_DATE} …")
@@ -64,11 +58,9 @@ def download_prices() -> pd.DataFrame:
     print(f"Downloaded {len(close)} rows.")
     return close.dropna()
 
-
 def compute_returns(close: pd.DataFrame) -> pd.DataFrame:
     ret = 100 * np.log1p(close.pct_change())
     return ret.rename(columns={"SPX": "SPX_Return", "DAX": "DAX_Return"})
-
 
 def descriptive_stats(returns: pd.DataFrame) -> None:
     desc = returns.describe().T
@@ -80,7 +72,7 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
     desc["Jarque_Bera"] = [jb_spx.statistic, jb_dax.statistic]
     desc["JB_p_value"]  = [jb_spx.pvalue,     jb_dax.pvalue]
 
-    # 重新排版 & 重命名为人类可读标题（打印用）
+    # Format for printing
     printable = (
         desc[
             [
@@ -112,8 +104,6 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
     print(printable.to_markdown(floatfmt=".4f"))
     print("=" * 80 + "\n")
 
-
-
 def gap_summary(full_index: pd.DatetimeIndex) -> None:
     if not SHOW_GAP_SUMMARY:
         return
@@ -127,20 +117,21 @@ def gap_summary(full_index: pd.DatetimeIndex) -> None:
     gap_tbl = gaps.value_counts().rename_axis("Gap Size (days)").to_frame("Count")
     print(gap_tbl.to_markdown())
 
-
 def overview_plot(close: pd.DataFrame, returns: pd.DataFrame) -> None:
     plt.figure(figsize=(14, 10))
 
-    # price levels
+    # Price levels
     plt.subplot(2, 2, 1)
     close["SPX"].plot(color="royalblue")
-    plt.title("S&P 500 Price Series"); plt.grid(True)
+    plt.title("S&P 500 Price Series")
+    plt.grid(True)
 
     plt.subplot(2, 2, 2)
     close["DAX"].plot(color="seagreen")
-    plt.title("DAX Index"); plt.grid(True)
+    plt.title("DAX Index")
+    plt.grid(True)
 
-    # distributions
+    # Distributions
     plt.subplot(2, 2, 3)
     sns.histplot(returns["SPX_Return"], bins=60, kde=True, color="royalblue")
     plt.title("S&P 500 Return Distribution")
@@ -155,7 +146,6 @@ def overview_plot(close: pd.DataFrame, returns: pd.DataFrame) -> None:
     plt.savefig(OVERVIEW_PNG)
     plt.close()
     print(f"• Overview plot saved → {OVERVIEW_PNG}")
-
 
 def detect_extremes(
     returns: pd.DataFrame,
@@ -178,7 +168,6 @@ def detect_extremes(
         raise ValueError("THRESHOLD_MODE must be 'fixed' or 'dual'.")
 
     return cond_spx, cond_dax, thr_spx, thr_dax
-
 
 def extreme_plot(
     returns: pd.DataFrame,
@@ -213,7 +202,8 @@ def extreme_plot(
             ax[0].axhline(thr_spx, ls=":", color="grey", lw=0.8)
             ax[0].axhline(-thr_spx, ls=":", color="grey", lw=0.8)
     ax[0].axhline(0, ls="--", color="black", lw=0.6, alpha=0.5)
-    ax[0].set_title("S&P 500 Daily Returns"); ax[0].legend()
+    ax[0].set_title("S&P 500 Daily Returns")
+    ax[0].legend()
 
     # DAX
     ax[1].plot(
@@ -228,7 +218,7 @@ def extreme_plot(
         returns.index[cond_dax],
         returns.loc[cond_dax, "DAX_Return"],
         color="red",
-        s=36,
+        s=20,
         zorder=5,
         label="Extreme Returns",
     )
@@ -239,16 +229,13 @@ def extreme_plot(
             ax[1].axhline(thr_dax, ls=":", color="grey", lw=0.8)
             ax[1].axhline(-thr_dax, ls=":", color="grey", lw=0.8)
     ax[1].axhline(0, ls="--", color="black", lw=0.6, alpha=0.5)
-    ax[1].set_title("DAX Daily Returns"); ax[1].legend()
+    ax[1].set_title("DAX Daily Returns")
+    ax[1].legend()
 
     plt.tight_layout()
     plt.savefig(EXTREME_RETURNS_PNG)
     plt.close()
-    print(f"• Extreme‑return plot saved → {EXTREME_RETURNS_PNG}")
-
-
-# -----------------------------------------------------------------------------
-
+    print(f"• Extreme-return plot saved → {EXTREME_RETURNS_PNG}")
 
 def main() -> None:
     close = download_prices()
@@ -267,7 +254,7 @@ def main() -> None:
     events["Extreme_SPX"] = cond_spx.loc[events.index]
     events["Extreme_DAX"] = cond_dax.loc[events.index]
     events.to_csv(EXTREME_EVENTS_CSV)
-    print(f"• Extreme‑event table saved → {EXTREME_EVENTS_CSV}")
+    print(f"• Extreme-event table saved → {EXTREME_EVENTS_CSV}")
     print(
         f"  > Extreme counts | SPX: {cond_spx.sum()}  DAX: {cond_dax.sum()} "
         f"(mode = {THRESHOLD_MODE})"
@@ -277,6 +264,6 @@ def main() -> None:
 
     print("\nProcess completed.")
 
-
 if __name__ == "__main__":
     main()
+
