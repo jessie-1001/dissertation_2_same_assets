@@ -1,278 +1,280 @@
+#!/usr/bin/env python3
 # =============================================================================
-# SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST – REV 7 (matches GED marginals)
+# SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST – REV 8
 # =============================================================================
+"""
+Rolling 1‑day VaR / ES forecast using:
+    • GED‑marginal GARCH(1,1) (SPX AR(1)+GJR | DAX Const+GARCH)
+    • Four copulas (Gaussian / Student‑t / survival‑Clayton / survival‑Gumbel)
+    • Dynamic min‑var portfolio weights (risk‑aversion & hard floor/cap)
+
+Rev 8 fix:
+    1. drop NaNs before τ / ρ estimation → ρ_G could be NaN
+    2. guard against empty ‘port’ array (percentile crash)
+"""
+# --------------------------------------------------------------------------- #
+# 0. Imports & helpers
+# --------------------------------------------------------------------------- #
 import os, pickle, warnings
-from itertools import product
-import numpy as np, pandas as pd
+from functools   import partial
+import numpy as np
+import pandas as pd
 from scipy.stats import norm, t, kendalltau, gennorm
 from scipy.linalg import cholesky
 from scipy.optimize import minimize
-from arch import arch_model
-from joblib import Parallel, delayed
-from tqdm import tqdm
-from statsmodels.stats.diagnostic import het_arch
-from math import gamma   
+from arch         import arch_model
+from joblib       import Parallel, delayed
+from tqdm         import tqdm
+from math         import gamma           # for GED scaling
 
-warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# --------------------------------------------------------------------------- #
-# 0. Utility helpers
-# --------------------------------------------------------------------------- #
 def _safe_chol(corr):
-    """Cholesky with PD‑repair on the fly."""
+    """Cholesky with PSD‑repair."""
     try:
         return cholesky(corr, lower=True)
     except np.linalg.LinAlgError:
-        eigval, eigvec = np.linalg.eigh(corr)
-        eigval = np.clip(eigval, 1e-6, None)
-        corr   = eigvec @ np.diag(eigval) @ eigvec.T
-        D      = np.diag(1 / np.sqrt(np.diag(corr)))
-        return cholesky(D @ corr @ D, lower=True)
+        w, v = np.linalg.eigh(corr)
+        w    = np.clip(w, 1e-6, None)
+        corr = v @ np.diag(w) @ v.T
+        d    = np.diag(1 / np.sqrt(np.diag(corr)))
+        return cholesky(d @ corr @ d, lower=True)
 
-# ‘generalised error’ helper – SciPy’s gennorm uses β param = ν
+# GED quantile (SciPy‘s gennorm uses β = ν)
 def _ged_ppf(u, nu):
-    β = np.sqrt((2**(2/nu)) * gamma(1/nu) / gamma(3/nu))
-    return gennorm.ppf(u, nu, scale=β)
+    beta = np.sqrt((2 ** (2 / nu)) * gamma(1 / nu) / gamma(3 / nu))
+    return gennorm.ppf(u, nu, scale=beta)
 
-def _ppf(u, dist_name, df):
-    return _ged_ppf(u, df) if dist_name == 'ged' else t.ppf(u, df=df)
+def _ppf(u, dist, df):
+    return _ged_ppf(u, df) if dist == "ged" else t.ppf(u, df=df)
 
 # --------------------------------------------------------------------------- #
 # 1. Copula samplers
 # --------------------------------------------------------------------------- #
 def gauss_copula(n, corr):
-    L = _safe_chol(corr)
-    z = np.random.normal(size=(n, 2)) @ L.T
+    z = np.random.randn(n, 2) @ _safe_chol(corr).T
     return norm.cdf(z)
 
 def t_copula(n, corr, df):
-    L = _safe_chol(corr)
     g = np.random.chisquare(df, n)
-    z = np.random.normal(size=(n, 2)) @ L.T
+    z = np.random.randn(n, 2) @ _safe_chol(corr).T
     return t.cdf(z * np.sqrt(df / g)[:, None], df=df)
 
 def clayton_copula(n, theta):
-    """Stable Clayton sampler (Marshall–Olkin, log‑space)."""
     if theta <= 0:
-        return np.random.uniform(size=(n, 2))
-    g   = np.random.gamma(1.0 / theta, 1.0, n)       # Γ(k=1/θ,1)
-    e1  = np.random.exponential(size=n)
-    e2  = np.random.exponential(size=n)
-    logu = -np.log1p(e1 / g) / theta                 # log U
-    logv = -np.log1p(e2 / g) / theta
-    return np.column_stack((np.exp(logu), np.exp(logv))).clip(1e-6, 1-1e-6)
+        return np.random.rand(n, 2)
+    g  = np.random.gamma(1 / theta, 1, n)
+    e1, e2 = np.random.exponential(size=(2, n))
+    u = np.exp(-np.log1p(e1 / g) / theta)
+    v = np.exp(-np.log1p(e2 / g) / theta)
+    return np.column_stack((u, v)).clip(1e-6, 1 - 1e-6)
 
 def gumbel_copula(n, theta):
-    """Stable Gumbel sampler (Marshall–Olkin, log‑space)."""
-    if theta <= 1.0:
-        return np.random.uniform(size=(n, 2))
-    beta = 1.0 / theta
-    s    = np.random.gamma(1.0 / beta, 1.0, n)       # shared Γ
+    if theta <= 1:
+        return np.random.rand(n, 2)
+    beta = 1 / theta
+    s    = np.random.gamma(1 / beta, 1, n)
     e    = np.random.exponential(size=(n, 2))
-    logu = -e[:, 0] / (s ** beta)
-    logv = -e[:, 1] / (s ** beta)
-    return np.column_stack((np.exp(logu), np.exp(logv))).clip(1e-6, 1-1e-6)
+    u = np.exp(-e[:, 0] / (s ** beta))
+    v = np.exp(-e[:, 1] / (s ** beta))
+    return np.column_stack((u, v)).clip(1e-6, 1 - 1e-6)
 
-def surv_clayton(n, theta):
-    u, v = clayton_copula(n, theta).T
-    return 1.0 - u, 1.0 - v
+def surv_clayton(n, θ):   # upper‑tail dependence
+    u, v = clayton_copula(n, θ).T
+    return 1 - u, 1 - v
 
-def surv_gumbel(n, theta):
-    u, v = gumbel_copula(n, theta).T
-    return 1.0 - u, 1.0 - v
+def surv_gumbel(n, θ):
+    u, v = gumbel_copula(n, θ).T
+    return 1 - u, 1 - v
 
 # --------------------------------------------------------------------------- #
-# 2. Copula parameter fitting (MLE + Kendall’s τ transform)
+# 2. Copula parameter estimation
 # --------------------------------------------------------------------------- #
-def fit_t_copula(u):
-    tau, _ = kendalltau(u.iloc[:,0], u.iloc[:,1])
+def fit_t_copula(u_df: pd.DataFrame):
+    """MLE for bivariate Student‑t copula (ρ, ν)."""
+    u_df = u_df.dropna()
+    tau, _ = kendalltau(u_df.iloc[:, 0], u_df.iloc[:, 1])
     rho0   = np.sin(np.pi * tau / 2)
-    bounds = [(-0.99, .99), (2.1, 30)]
+
+    u_arr  = u_df.to_numpy()                    # <<< 转成 ndarray 仅一次
+    bounds = [(-0.99, .99), (2.1, 40)]
+
     def nll(p):
         ρ, ν = p
-        if abs(ρ) >= .99: return 1e10
-        z = t.ppf(u, df=ν)
-        L = _safe_chol(np.array([[1, ρ],[ρ,1]]))
-        q = np.linalg.solve(L, z.T).T
-        logdet = 2*np.log(L.diagonal()).sum()
-        ll = t.logpdf(q, df=ν).sum(axis=1) - logdet
+        if abs(ρ) >= .99:
+            return 1e6
+        L   = _safe_chol(np.array([[1, ρ], [ρ, 1]]))
+        z   = t.ppf(u_arr.clip(1e-6, 1 - 1e-6), df=ν)   # Nx2 ndarray
+        q   = np.linalg.solve(L, z.T).T
+        ll  = t.logpdf(q, df=ν).sum(axis=1) - 2*np.log(np.diag(L)).sum()
         return -ll.sum()
-    best = minimize(nll, [rho0, 8], bounds=bounds, method='L-BFGS-B')
-    ρ, ν = best.x
-    return {'corr_matrix': np.array([[1, ρ],[ρ,1]]), 'df': ν}
 
-def fit_theta(family, u):
-    if family == 'Clayton':
-        tau, _ = kendalltau(*u.T)
-        return max(0.1, 2*tau/(1-tau+1e-9))
-    if family == 'Gumbel':
-        tau, _ = kendalltau(*u.T)
-        return max(1.01, 1/(1-tau+1e-9))
+    ρ_hat, ν_hat = minimize(nll, [rho0, 10],
+                            bounds=bounds, method="L-BFGS-B").x
+    return {"corr_matrix": np.array([[1, ρ_hat], [ρ_hat, 1]]), "df": ν_hat}
 
-def estimate_copulas(u_df):
-    # 增加尾部依赖的保守性调整因子（0.8-0.9范围）
-    TAIL_ADJUST = 0.85
-    
+def _theta_from_tau(fam, u_df):
+    tau, _ = kendalltau(u_df.iloc[:, 0], u_df.iloc[:, 1])
+    if fam == "Clayton":
+        return max(0.1, 2 * tau / (1 - tau + 1e-9))
+    if fam == "Gumbel":
+        return max(1.01, 1 / (1 - tau + 1e-9))
+
+def estimate_copulas(u_raw: pd.DataFrame):
+    """Return dict with Gaussian / t / survival‑Clayton / survival‑Gumbel."""
+    u = u_raw.dropna()          # 先清理缺失
+    if u.empty:
+        raise ValueError("Input PIT series全为空，无法估计 copula 参数。")
+
+    z = norm.ppf(u.clip(1e-6, 1 - 1e-6).values)
+    ρG = np.corrcoef(z.T)[0, 1]
+    if not np.isfinite(ρG):
+        ρG = 0.0                # 回退
+
     # Gaussian
-    ρG = np.corrcoef(norm.ppf(u_df.values).T)[0,1]
-    gaussian = {'corr_matrix': np.array([[1, ρG],[ρG,1]]), 'rho': ρG}
-    
-    # t-Copula
-    t_par = fit_t_copula(u_df)
-    
-    # 应用尾部调整
-    t_par['corr_matrix'] = np.array([[1, ρG],[ρG,1]])  # 使用高斯相关度
-    t_par['df'] = max(10, t_par['df'] * 1.2)  # 增加自由度（减少尾部厚度）
-    
-    # Clayton/Gumbel - 减少尾部依赖
-    θc = fit_theta('Clayton', u_df.values) * TAIL_ADJUST
-    θg = fit_theta('Gumbel', u_df.values) * TAIL_ADJUST
-    
-    ρc = np.sin(np.pi*(θc/(θc+2))/2)
-    ρg = np.sin(np.pi*(1-1/θg)/2)
-    
+    gaussian = {"corr_matrix": np.array([[1, ρG], [ρG, 1]]), "rho": ρG}
+
+    # Student‑t
+    t_par = fit_t_copula(u)
+    t_par["df"] = max(8, t_par["df"])          # 保守化
+
+    # Tail copulas（使用 upper‑tail / lower‑tail 版本）
+    TAIL_ADJ = 0.9
+    θc = _theta_from_tau("Clayton", u) * TAIL_ADJ
+    θg = _theta_from_tau("Gumbel",  u) * TAIL_ADJ
+    ρc = np.sin(np.pi * (θc / (θc + 2)) / 2)
+    ρg = np.sin(np.pi * (1 - 1 / θg) / 2)
+    ρT = t_par["corr_matrix"][0, 1]
+
     print("\n--- Adjusted Copula Parameters ---")
-    print(f" Student-t ρ={t_par['corr_matrix'][0,1]:.3f}  ν={t_par['df']:.1f}")
-    print(f" Clayton   θ={θc:.2f}  ρ={ρc:.3f}")
-    print(f" Gumbel    θ={θg:.2f}  ρ={ρg:.3f}")
-    
+    print(f" Gaussian   ρ = {ρG:.3f}")
+    print(f" Student‑t  ρ = {ρT:.3f}  ν = {t_par['df']:.1f}")
+    print(f" Clayton    θ = {θc:.2f}  ρ ≈ {ρc:.3f}")
+    print(f" Gumbel     θ = {θg:.2f}  ρ ≈ {ρg:.3f}")
+
     return {
-        'Gaussian': gaussian,
-        'StudentT': t_par,
-        'Clayton': {'theta': θc, 'rho': ρc},
-        'Gumbel': {'theta': θg, 'rho': ρg}
+        "Gaussian": gaussian,
+        "StudentT": t_par,
+        "Clayton" : {"theta": θc, "rho": ρc},
+        "Gumbel"  : {"theta": θg, "rho": ρg},
     }
 
 # --------------------------------------------------------------------------- #
-# 3. Marginal GARCH (GED) fit + 1‑day forecast
+# 3. Marginal GARCH fit
 # --------------------------------------------------------------------------- #
 def garch_fit(series, asset):
-    # 减少GARCH参数持续性 (alpha + beta)
-    if asset == 'SPX':
-        mdl = arch_model(series, mean='AR', lags=1,
-                         vol='GARCH', p=1, o=1, q=1, dist='ged')
-        res = mdl.fit(disp='off', update_freq=0)
-        
-        # 调整参数：减少持续性，增加新息影响
-        alpha = min(0.15, res.params.get('alpha[1]', 0.1))
-        beta = min(0.80, res.params.get('beta[1]', 0.8))
-        res.params['alpha[1]'] = alpha * 1.2  # 增加新息影响
-        res.params['beta[1]'] = beta * 0.9    # 减少持续性
-        
-        return res
+    if asset == "SPX":
+        mdl = arch_model(series, mean="AR", lags=1, vol="GARCH",
+                         p=1, o=1, q=1, dist="ged")
     else:
-        # DAX保持相对稳定
-        mdl = arch_model(series, mean='Constant',
-                         vol='GARCH', p=1, q=1, dist='ged')
-        return mdl.fit(disp='off')
-    
-# --------------------------------------------------------------------------- #
-def min_var_w(vol1, vol2, rho, floor=0.3, cap=0.7, risk_aversion=1.2):
-    """Constrained risk-adjusted weights"""
-    # 计算协方差矩阵
+        mdl = arch_model(series, mean="Constant", vol="GARCH",
+                         p=1, q=1, dist="ged")
+    return mdl.fit(disp="off")
+
+def min_var_w(vol1, vol2, rho, floor=0.3, cap=0.7):
     cov = rho * vol1 * vol2
-    cov_matrix = np.array([
-        [vol1**2, cov],
-        [cov, vol2**2]
-    ])
-    
-    # 计算最小方差权重
-    inv_cov = np.linalg.inv(cov_matrix)
-    ones = np.ones(2)
-    min_var_w = inv_cov.dot(ones) / ones.dot(inv_cov).dot(ones)
-    
-    # 应用风险偏好调整
-    w1 = min_var_w[0] * risk_aversion
-    w1 = np.clip(w1, floor, cap)
+    Σ   = np.array([[vol1 ** 2, cov], [cov, vol2 ** 2]])
+    inv = np.linalg.inv(Σ)
+    w   = inv @ np.ones(2) / (np.ones(2) @ inv @ np.ones(2))
+    w1  = np.clip(w[0], floor, cap)
     return w1, 1 - w1
 
 # --------------------------------------------------------------------------- #
-def one_day(date, full_df, cop_par, sims=40000):
+def one_day(date, full_df, cop_par, sims=40_000):
     idx = full_df.index.get_loc(date)
-    if idx == 0: return None          # skip first day
-    hist = full_df.iloc[:idx]         # window until t‑1
-    # marginal fits
-    fit_s = garch_fit(hist['SPX_Return'], 'SPX')
-    fit_d = garch_fit(hist['DAX_Return'], 'DAX')
-    σs = np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0,0])
-    σd = np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0,0])
-    μs = fit_s.params.get('mu',0)
-    μd = fit_d.params.get('mu',0)
-    νs = fit_s.params.get('nu',1.5)
-    νd = fit_d.params.get('nu',1.5)
+    if idx == 0:
+        return None
+    hist = full_df.iloc[:idx]
 
+    # ----- marginals -----
+    fit_s = garch_fit(hist["SPX_Return"], "SPX")
+    fit_d = garch_fit(hist["DAX_Return"], "DAX")
+    σs = np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0, 0])
+    σd = np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0, 0])
+    μs = fit_s.params.get("mu", 0)
+    μd = fit_d.params.get("mu", 0)
+    νs = fit_s.params.get("nu", 1.5)
+    νd = fit_d.params.get("nu", 1.5)
+
+    # ----- copula samplers -----
+    samplers = {
+        "Gaussian": lambda n: gauss_copula(n, cop_par["Gaussian"]["corr_matrix"]),
+        "StudentT": lambda n: t_copula(
+            n,
+            cop_par["StudentT"]["corr_matrix"],
+            cop_par["StudentT"]["df"]
+        ),
+        # ------- 只改下面两行 -------
+        "Clayton": lambda n: clayton_copula(n, cop_par["Clayton"]["theta"]),  # 标准=下尾
+        "Gumbel":  lambda n: np.column_stack(surv_gumbel(n, cop_par["Gumbel"]["theta"]))
+    }
     results = {}
-    samplers = {'Gaussian':lambda n: gauss_copula(n,cop_par['Gaussian']['corr_matrix']),
-                'StudentT':lambda n: t_copula(n,cop_par['StudentT']['corr_matrix'],
-                                              cop_par['StudentT']['df']),
-                'Clayton' :lambda n: np.column_stack(surv_clayton(n, cop_par['Clayton']['theta'])),
-                'Gumbel'  :lambda n: np.column_stack(surv_gumbel (n, cop_par['Gumbel']['theta']))}
+    for name, sampler in samplers.items():
+        # ρ 用于权重
+        rho = {
+            "Gaussian": cop_par["Gaussian"]["rho"],
+            "StudentT": cop_par["StudentT"]["corr_matrix"][0, 1],
+            "Clayton" : cop_par["Clayton"]["rho"],
+            "Gumbel"  : cop_par["Gumbel"]["rho"],
+        }[name]
 
-    for name, gen in samplers.items():
-        # 为每个copula模型使用其特定的相关性参数
-        if name == 'Gaussian':
-            rho = cop_par['Gaussian']['corr_matrix'][0,1]
-        elif name == 'StudentT':
-            rho = cop_par['StudentT']['corr_matrix'][0,1]
-        elif name == 'Clayton':
-            rho = cop_par['Clayton']['rho']
-        elif name == 'Gumbel':
-            rho = cop_par['Gumbel']['rho']
-        
-        # 使用特定copula的相关性计算权重
         w_s, w_d = min_var_w(σs, σd, rho)
-        
-        u = gen(sims)
-        zs = _ppf(u[:,0], 'ged', νs)
-        zd = _ppf(u[:,1], 'ged', νd)
-        r_s = μs + σs*zs
-        r_d = μd + σd*zd
-        port = w_s*r_s + w_d*r_d
+        u        = sampler(sims)
+        zs = _ppf(u[:, 0], "ged", νs)
+        zd = _ppf(u[:, 1], "ged", νd)
+        port = w_s * (μs + σs * zs) + w_d * (μd + σd * zd)
         port = port[np.isfinite(port)]
-        VaR = np.percentile(port, 1)
-        ES  = port[port<=VaR].mean()
-        
+
+        # ------ guard: too few obs → NaN ------
+        if port.size < 50:
+            VaR = ES = np.nan
+        else:
+            VaR = np.percentile(port, 1)
+            ES  = port[port <= VaR].mean()
+
         results[name] = {
-            'VaR': VaR,
-            'ES': ES,
-            'wSPX': w_s,
-            'wDAX': w_d,
-            'volSPX': σs,
-            'volDAX': σd
+            "VaR"   : VaR,
+            "ES"    : ES,
+            "wSPX"  : w_s,
+            "wDAX"  : w_d,
+            "volSPX": σs,
+            "volDAX": σd,
         }
-    
-    flat = {'Date': date}
-    for k, v in results.items():
-        for kk, vv in v.items(): 
-            flat[f'{k}_{kk}'] = vv
-    
+
+    flat = {"Date": date}
+    for fam, d in results.items():
+        for k, v in d.items():
+            flat[f"{fam}_{k}"] = v
     return flat
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    print("\n"+"="*80)
-    print(">>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST – REV 7 <<<")
-    # -------- load data -------------
-    u_df = pd.read_csv("copula_input_data.csv", index_col=0, parse_dates=True)
-    full = pd.read_csv("spx_dax_daily_data.csv", index_col=0, parse_dates=True)
-    # -------- copula parameters -----
-    cop_par = estimate_copulas(u_df)
-    # -------- rolling dates ---------
+    print("=" * 80)
+    print(">>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST <<<")
+
+    # ---------- 1. load data ----------
+    u_df  = pd.read_csv("copula_input_data.csv", index_col=0, parse_dates=True)
+    full  = pd.read_csv("spx_dax_daily_data.csv", index_col=0, parse_dates=True)
+
+    # ---------- 2. copula params -------
+    cop = estimate_copulas(u_df)
+
+    # ---------- 3. rolling forecast ----
     oos_start = "2020-01-02"
-    dates = full.loc[oos_start:].index
-    print(f"\nRolling forecast {len(dates)} days …")
-    forecasts = Parallel(n_jobs=-1, backend="loky", verbose=0)(
-        delayed(one_day)(d, full, cop_par) for d in tqdm(dates)
+    dates     = full.loc[oos_start:].index
+    print(f"\nRolling forecast for {len(dates)} trading days …")
+
+    forecasts = Parallel(n_jobs=-1, backend="loky")(
+        delayed(one_day)(d, full, cop) for d in tqdm(dates)
     )
-    forecasts = [f for f in forecasts if f]  # drop None (first day)
-    res = pd.DataFrame(forecasts).set_index('Date').sort_index()
-    
-    # -------- save ------------------
-    # 修复：指定UTF-8编码保存CSV
-    res.to_csv("garch_copula_all_results.csv", float_format="%.6f", encoding='utf-8')
-    with open("copula_params.pkl", "wb") as f: 
-        pickle.dump(cop_par, f)
-    
-    print("Output  : garch_copula_all_results.csv")
-    print("Copulas : copula_params.pkl")
-    print("="*80+"\n")
+    forecasts = [f for f in forecasts if f]           # drop first None
+    res       = pd.DataFrame(forecasts).set_index("Date").sort_index()
+
+    # ---------- 4. save ---------------
+    res.to_csv("garch_copula_all_results.csv", float_format="%.6f", encoding="utf-8")
+    with open("copula_params.pkl", "wb") as fh:
+        pickle.dump(cop, fh)
+
+    print("\nSaved → garch_copula_all_results.csv")
+    print("Params → copula_params.pkl")
+    print("=" * 80)
