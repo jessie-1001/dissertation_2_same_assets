@@ -16,37 +16,42 @@ Rev 8 fix:
 # 0. Imports & helpers
 # --------------------------------------------------------------------------- #
 import os, pickle, warnings
-from functools   import partial
-import numpy as np
-import pandas as pd
+import numpy as np, pandas as pd
 from scipy.stats import norm, t, kendalltau, gennorm
 from scipy.linalg import cholesky
 from scipy.optimize import minimize
-from arch         import arch_model
-from joblib       import Parallel, delayed
-from tqdm         import tqdm
-from math         import gamma           # for GED scaling
+from arch import arch_model
+from joblib import Parallel, delayed
+from tqdm import tqdm
+from math import gamma
+
+# === three knobs ============================================================
+ALPHA_SCALE = 1.00     # 1 = keep alpha; >1 boost; <1 shrink
+BETA_CAP    = 0.75      # upper cap for beta -> shorter memory
+REFIT_FREQ  = 63       # re‑estimate every ~3 months
+# ============================================================================
+_last_idx, _cache_spx, _cache_dax = -999, None, None    # forecast cache
+# --------------------------------------------------------------------------- #
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 def _safe_chol(corr):
-    """Cholesky with PSD‑repair."""
     try:
         return cholesky(corr, lower=True)
     except np.linalg.LinAlgError:
         w, v = np.linalg.eigh(corr)
-        w    = np.clip(w, 1e-6, None)
-        corr = v @ np.diag(w) @ v.T
-        d    = np.diag(1 / np.sqrt(np.diag(corr)))
+        corr = v @ np.diag(np.clip(w, 1e-6, None)) @ v.T
+        d    = np.diag(1/np.sqrt(np.diag(corr)))
         return cholesky(d @ corr @ d, lower=True)
 
-# GED quantile (SciPy‘s gennorm uses β = ν)
+# ---------- GED ppf helper --------------------------------------------------
 def _ged_ppf(u, nu):
-    beta = np.sqrt((2 ** (2 / nu)) * gamma(1 / nu) / gamma(3 / nu))
+    beta = np.sqrt((2**(2/nu))*gamma(1/nu)/gamma(3/nu))
     return gennorm.ppf(u, nu, scale=beta)
 
 def _ppf(u, dist, df):
-    return _ged_ppf(u, df) if dist == "ged" else t.ppf(u, df=df)
+    return _ged_ppf(u, df) if dist=="ged" else t.ppf(u, df=df)
+
 
 # --------------------------------------------------------------------------- #
 # 1. Copula samplers
@@ -136,10 +141,10 @@ def estimate_copulas(u_raw: pd.DataFrame):
 
     # Student‑t
     t_par = fit_t_copula(u)
-    t_par["df"] = max(8, t_par["df"])          # 保守化
+    t_par["df"] = min(30, t_par["df"])          #tiaocan############################################
 
     # Tail copulas（使用 upper‑tail / lower‑tail 版本）
-    TAIL_ADJ = 0.9
+    TAIL_ADJ = 0.95 #tiaocan############################################
     θc = _theta_from_tau("Clayton", u) * TAIL_ADJ
     θg = _theta_from_tau("Gumbel",  u) * TAIL_ADJ
     ρc = np.sin(np.pi * (θc / (θc + 2)) / 2)
@@ -163,15 +168,17 @@ def estimate_copulas(u_raw: pd.DataFrame):
 # 3. Marginal GARCH fit
 # --------------------------------------------------------------------------- #
 def garch_fit(series, asset):
-    if asset == "SPX":
-        mdl = arch_model(series, mean="AR", lags=1, vol="GARCH",
-                         p=1, o=1, q=1, dist="ged")
+    if asset=="SPX":
+        mdl=arch_model(series,mean="AR",lags=1,vol="GARCH",p=1,o=1,q=1,dist="ged")
     else:
-        mdl = arch_model(series, mean="Constant", vol="GARCH",
-                         p=1, q=1, dist="ged")
-    return mdl.fit(disp="off")
+        mdl=arch_model(series,mean="Constant",vol="GARCH",p=1,q=1,dist="ged")
+    res=mdl.fit(disp="off")
+    if "alpha[1]" in res.params: res.params["alpha[1]"]*=ALPHA_SCALE
+    if "beta[1]"  in res.params: res.params["beta[1]"]=min(res.params["beta[1]"],BETA_CAP)
+    return res
 
-def min_var_w(vol1, vol2, rho, floor=0.3, cap=0.7):
+
+def min_var_w(vol1, vol2, rho, floor=0.2, cap=0.8):
     cov = rho * vol1 * vol2
     Σ   = np.array([[vol1 ** 2, cov], [cov, vol2 ** 2]])
     inv = np.linalg.inv(Σ)
@@ -180,101 +187,71 @@ def min_var_w(vol1, vol2, rho, floor=0.3, cap=0.7):
     return w1, 1 - w1
 
 # --------------------------------------------------------------------------- #
-def one_day(date, full_df, cop_par, sims=40_000):
+def one_day(date, full_df, cop, sims=40_000):
+    global _last_idx,_cache_spx,_cache_dax
     idx = full_df.index.get_loc(date)
-    if idx == 0:
-        return None
-    hist = full_df.iloc[:idx]
+    if idx==0: return None
 
-    # ----- marginals -----
-    fit_s = garch_fit(hist["SPX_Return"], "SPX")
-    fit_d = garch_fit(hist["DAX_Return"], "DAX")
-    σs = np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0, 0])
-    σd = np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0, 0])
-    μs = fit_s.params.get("mu", 0)
-    μd = fit_d.params.get("mu", 0)
-    νs = fit_s.params.get("nu", 1.5)
-    νd = fit_d.params.get("nu", 1.5)
+    # --------- refit every REFIT_FREQ days ----------
+    if (idx-_last_idx)>=REFIT_FREQ or _cache_spx is None:
+        hist = full_df.iloc[:idx]
+        _cache_spx = garch_fit(hist["SPX_Return"],"SPX")
+        _cache_dax = garch_fit(hist["DAX_Return"],"DAX")
+        _last_idx  = idx
+    fit_s,fit_d=_cache_spx,_cache_dax                    # use cache
 
-    # ----- copula samplers -----
-    samplers = {
-        "Gaussian": lambda n: gauss_copula(n, cop_par["Gaussian"]["corr_matrix"]),
-        "StudentT": lambda n: t_copula(
-            n,
-            cop_par["StudentT"]["corr_matrix"],
-            cop_par["StudentT"]["df"]
-        ),
-        # ------- 只改下面两行 -------
-        "Clayton": lambda n: clayton_copula(n, cop_par["Clayton"]["theta"]),  # 标准=下尾
-        "Gumbel":  lambda n: np.column_stack(surv_gumbel(n, cop_par["Gumbel"]["theta"]))
+    σs=np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0,0])
+    σd=np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0,0])
+    μs,μd = fit_s.params.get("mu",0), fit_d.params.get("mu",0)
+    νs,νd = fit_s.params.get("nu",1.5),fit_d.params.get("nu",1.5)
+
+    samplers={
+        "Gaussian":lambda n:gauss_copula(n,cop["Gaussian"]["corr_matrix"]),
+        "StudentT":lambda n:t_copula(n,cop["StudentT"]["corr_matrix"],cop["StudentT"]["df"]),
+        "Clayton" :lambda n:clayton_copula(n,cop["Clayton"]["theta"]),
+        "Gumbel"  :lambda n:np.column_stack(surv_gumbel(n,cop["Gumbel"]["theta"]))
     }
-    results = {}
-    for name, sampler in samplers.items():
-        # ρ 用于权重
-        rho = {
-            "Gaussian": cop_par["Gaussian"]["rho"],
-            "StudentT": cop_par["StudentT"]["corr_matrix"][0, 1],
-            "Clayton" : cop_par["Clayton"]["rho"],
-            "Gumbel"  : cop_par["Gumbel"]["rho"],
-        }[name]
 
-        w_s, w_d = min_var_w(σs, σd, rho)
-        u        = sampler(sims)
-        zs = _ppf(u[:, 0], "ged", νs)
-        zd = _ppf(u[:, 1], "ged", νd)
-        port = w_s * (μs + σs * zs) + w_d * (μd + σd * zd)
-        port = port[np.isfinite(port)]
+    out={}
+    for name,gen in samplers.items():
+        rho={"Gaussian":cop["Gaussian"]["rho"],
+             "StudentT":cop["StudentT"]["corr_matrix"][0,1],
+             "Clayton" :cop["Clayton"]["rho"],
+             "Gumbel"  :cop["Gumbel"]["rho"]}[name]
+        w_s,w_d=min_var_w(σs,σd,rho)
+        u=gen(sims); port=w_s*(μs+σs*_ppf(u[:,0],"ged",νs))+w_d*(μd+σd*_ppf(u[:,1],"ged",νd))
+        port=port[np.isfinite(port)]
+        if port.size<50: VaR=ES=np.nan
+        else:            VaR=np.percentile(port,1); ES=port[port<=VaR].mean()
+        out.update({f"{name}_VaR":VaR,f"{name}_ES":ES,f"{name}_wSPX":w_s,f"{name}_wDAX":w_d,
+                    f"{name}_volSPX":σs,f"{name}_volDAX":σd})
 
-        # ------ guard: too few obs → NaN ------
-        if port.size < 50:
-            VaR = ES = np.nan
-        else:
-            VaR = np.percentile(port, 1)
-            ES  = port[port <= VaR].mean()
-
-        results[name] = {
-            "VaR"   : VaR,
-            "ES"    : ES,
-            "wSPX"  : w_s,
-            "wDAX"  : w_d,
-            "volSPX": σs,
-            "volDAX": σd,
-        }
-
-    flat = {"Date": date}
-    for fam, d in results.items():
-        for k, v in d.items():
-            flat[f"{fam}_{k}"] = v
-    return flat
-
+    out["Date"]=date
+    return out
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    print("=" * 80)
-    print(">>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST <<<")
+# 5 |  util for weights
+# --------------------------------------------------------------------------- #
+def min_var_w(vol1,vol2,rho,floor=0.3,cap=0.7):
+    Σ=np.array([[vol1**2,rho*vol1*vol2],[rho*vol1*vol2,vol2**2]])
+    inv=np.linalg.inv(Σ); w=inv@np.ones(2)/ (np.ones(2)@inv@np.ones(2))
+    w1=np.clip(w[0],floor,cap)
+    return w1,1-w1
+# --------------------------------------------------------------------------- #
+if __name__=="__main__":
+    print("="*80,"\n>>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST <<<")
+    u_df=pd.read_csv("copula_input_data.csv",index_col=0,parse_dates=True)
+    full=pd.read_csv("spx_dax_daily_data.csv",index_col=0,parse_dates=True)
+    cop=estimate_copulas(u_df)
 
-    # ---------- 1. load data ----------
-    u_df  = pd.read_csv("copula_input_data.csv", index_col=0, parse_dates=True)
-    full  = pd.read_csv("spx_dax_daily_data.csv", index_col=0, parse_dates=True)
-
-    # ---------- 2. copula params -------
-    cop = estimate_copulas(u_df)
-
-    # ---------- 3. rolling forecast ----
-    oos_start = "2020-01-02"
-    dates     = full.loc[oos_start:].index
+    oos_start="2020-01-02"
+    dates=full.loc[oos_start:].index
     print(f"\nRolling forecast for {len(dates)} trading days …")
 
-    forecasts = Parallel(n_jobs=-1, backend="loky")(
-        delayed(one_day)(d, full, cop) for d in tqdm(dates)
-    )
-    forecasts = [f for f in forecasts if f]           # drop first None
-    res       = pd.DataFrame(forecasts).set_index("Date").sort_index()
+    forecasts=Parallel(n_jobs=-1,backend="loky")(
+        delayed(one_day)(d,full,cop) for d in tqdm(dates))
+    res=pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
 
-    # ---------- 4. save ---------------
-    res.to_csv("garch_copula_all_results.csv", float_format="%.6f", encoding="utf-8")
-    with open("copula_params.pkl", "wb") as fh:
-        pickle.dump(cop, fh)
-
-    print("\nSaved → garch_copula_all_results.csv")
-    print("Params → copula_params.pkl")
-    print("=" * 80)
+    res.to_csv("garch_copula_all_results.csv",float_format="%.6f",encoding="utf-8")
+    with open("copula_params.pkl","wb") as fh: pickle.dump(cop,fh)
+    print("\nSaved → garch_copula_all_results.csv  &  copula_params.pkl")
+    print("="*80)
