@@ -9,7 +9,7 @@ Distribution:      Standardized Skew Student's t   AIC:                         
 Method:                       Maximum Likelihood   BIC:                           12328.1
                                                    No. Observations:                 4548
 Date:                           Tue, Jul 29 2025   Df Residuals:                     4546
-Time:                                   19:26:16   Df Model:                            2
+Time:                                   21:58:28   Df Model:                            2
                                    Mean Model                                  
 ===============================================================================
                     coef    std err          t      P>|t|      95.0% Conf. Int.

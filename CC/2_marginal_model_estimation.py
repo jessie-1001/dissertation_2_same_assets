@@ -131,13 +131,18 @@ def select_best(series, tag):
 
 def pit_series(res, series, eps=1e-9):
     """
-    Probability Integral Transform (PIT) for standardized residuals:
-    返回 U~Uniform(0,1) 的时间序列，可用于 copula 建模。
+    Probability Integral Transform (PIT) for standardized residuals.
+    This version passes parameters as a NumPy array to avoid all keyword naming issues.
     """
-    dist_obj = getattr(res, "distribution", res.model.distribution)
-    theta = res.params[-dist_obj.num_params:]
+    dist_obj = res.model.distribution
     std = pd.Series(res.std_resid, index=series.index).dropna()
-    u = dist_obj.cdf(std.to_numpy(), theta)
+
+    # Get the distribution parameters as a pandas Series
+    params = res.params[dist_obj.parameter_names()]
+
+    # Convert the Series to a NumPy array and pass it directly. This is the robust method.
+    u = dist_obj.cdf(std.to_numpy(), params.values)
+    
     return pd.Series(u, index=std.index).clip(eps, 1 - eps)
 
 def diagnostics(res, series, tag, vol):

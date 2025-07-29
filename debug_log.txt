@@ -1,0 +1,9 @@
+--- DEBUGGING FORECAST FOR DATE: 2020-01-08 00:00:00 ---
+SPX Distribution: Standardized Skew Student's t
+Type of dist_params_s: <class 'pandas.core.series.Series'>
+Value of dist_params_s:
+eta       5.769328
+lambda   -0.162498
+Name: params, dtype: float64
+
+The `**` operator will unpack the Series above into keyword arguments.

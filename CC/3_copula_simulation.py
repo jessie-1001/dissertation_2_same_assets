@@ -37,6 +37,11 @@ PARAM_GRID = {
     "tail_adj":   [1.0, 1.3],   # [1.0, 1.3, 1.5] - Multiplier for copula tail dependence
 }
 
+# --- GARCH Model Specifications ---
+VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
+DISTRIBUTIONS = ["t", "skewt", "ged"]
+MEAN_SPEC = {"Constant": dict(mean="Constant"), "AR": dict(mean="AR", lags=1)}
+
 # --- General Configuration ---
 SIMS_PER_DAY = 25000       # Number of simulations for each day's forecast
 OOS_START_DATE = "2020-01-02" # Start date for the out-of-sample forecast
@@ -64,18 +69,6 @@ def _safe_chol(corr):
         d = np.diag(1 / np.sqrt(np.diag(corr_psd)))
         return cholesky(d @ corr_psd @ d, lower=True)
 
-def _ged_ppf(u, nu):
-    beta = np.sqrt((2 ** (2 / nu)) * gamma(1 / nu) / gamma(3 / nu))
-    return gennorm.ppf(u, nu, scale=beta)
-
-def _ppf(u, dist_name, params):
-    dist_name = dist_name.lower()
-    if "ged" in dist_name:
-        return _ged_ppf(u, params[0])
-    elif "skewt" in dist_name:
-        return t.ppf(u, df=params[0]) # Approximation
-    else: # Student-t
-        return t.ppf(u, df=params[0])
 
 # --- Copula Samplers ---
 def gauss_copula(n, corr):
@@ -106,7 +99,7 @@ def gumbel_copula(n, theta):
 
 def surv_gumbel(n, θ):
     u, v = gumbel_copula(n, θ).T
-    return 1 - u, 1 - v
+    return np.column_stack((1 - u, 1 - v))
 
 # --- Copula Parameter Estimation ---
 def estimate_copulas(u_raw: pd.DataFrame, config: dict):
@@ -148,67 +141,94 @@ def estimate_copulas(u_raw: pd.DataFrame, config: dict):
 def fit_best_garch(series: pd.Series, tag: str, config: dict):
     """Selects the best GARCH model for a series based on BIC."""
     candidates = []
-    VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
-    DISTRIBUTIONS = ["t", "skewt", "ged"]
-    MEAN_SPEC = {"Constant": dict(mean="Constant"), "AR": dict(mean="AR", lags=1)}
 
     for mean_tag, mean_kw in MEAN_SPEC.items():
         for vol, dist in product(VOL_FAMILIES, DISTRIBUTIONS):
+            # We are only using p=1, q=1
+            p, q = 1, 1
             try:
-                mdl = arch_model(series, p=1, q=1, dist=dist, **mean_kw, **VOL_FAMILIES[vol])
+                mdl = arch_model(series, p=p, q=q, dist=dist, **mean_kw, **VOL_FAMILIES[vol])
                 res = mdl.fit(disp="off", show_warning=False)
                 if res.convergence_flag == 0:
-                    # Apply beta cap constraint
                     if "beta[1]" in res.params:
                         res.params["beta[1]"] = min(res.params["beta[1]"], config['beta_cap'])
-                    candidates.append((res.bic, res))
+                    
+                    # Store the result along with its specification details
+                    spec = (mean_tag, vol, dist, p, q)
+                    candidates.append((res.bic, res, spec))
             except Exception:
                 continue
 
     if not candidates:
-        mdl = arch_model(series, p=1, q=1, vol="GARCH", dist="t")
-        return mdl.fit(disp="off")
+        # Fallback to a simple, robust model if nothing else converges
+        print(f"  > [Warning] No models converged for {tag}. Defaulting to Constant+GARCH(1,1)-t.")
+        mdl = arch_model(series, p=1, q=1, vol="GARCH", dist="t", mean="Constant")
+        res = mdl.fit(disp="off")
+        spec = ("Constant", "GARCH", "t", 1, 1)
+        spec_str = "Constant+GARCH(1,1)-t"
+        return res, spec, res.bic, spec_str
         
-    _, best_res = min(candidates, key=lambda x: x[0])
-    return best_res
+    # Find the best model from the candidates based on BIC
+    best_bic, best_res, best_spec = min(candidates, key=lambda x: x[0])
+    
+    # Reconstruct the spec string for printing/logging
+    mean_tag, vol, dist, p, q = best_spec
+    spec_str = f"{mean_tag}+{vol}({p},{q})-{dist}"
+    
+    # print(f"  > Best model for {tag}: {spec_str}, BIC={best_bic:.2f}")
 
-def one_day_forecast(date, full_df, cop, config):
-    """Performs a single 1-day ahead forecast."""
-    global _last_idx, _cache_spx, _cache_dax
+    # Return all four expected values
+    return best_res, best_spec, best_bic, spec_str
+
+def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
+    """
+    Performs a completely self-contained 1-day ahead forecast for a given date.
+    This function is designed to be run in a separate process.
+    """
+    # --- 1. Data Preparation ---
     idx = full_df.index.get_loc(date)
-    if idx == 0: return None
+    hist_df = full_df.iloc[:idx + 1]
+    u_hist = u_df.loc[u_df.index < date] # Use pre-calculated PITs for copula fitting
 
-    if (idx - _last_idx) >= config['refit_freq'] or _cache_spx is None:
-        hist_df = full_df.iloc[:idx]
-        _cache_spx = fit_best_garch(hist_df["SPX_Return"], "SPX", config)
-        _cache_dax = fit_best_garch(hist_df["DAX_Return"], "DAX", config)
-        _last_idx = idx
-    
-    fit_s, fit_d = _cache_spx, _cache_dax
+    # --- 2. Fit Marginal GARCH Models ---
+    res_s, _, _, _ = fit_best_garch(hist_df["SPX_Return"], "SPX", config)
+    res_d, _, _, _ = fit_best_garch(hist_df["DAX_Return"], "DAX", config)
 
-    fc_s = fit_s.forecast(reindex=False)
-    fc_d = fit_d.forecast(reindex=False)
-    
-    μs, σs = fc_s.mean.iloc[0, 0], np.sqrt(fc_s.variance.iloc[0, 0])
-    μd, σd = fc_d.mean.iloc[0, 0], np.sqrt(fc_d.variance.iloc[0, 0])
-    
-    params_s = fit_s.params[-(fit_s.model.distribution.num_params):]
-    params_d = fit_d.params[-(fit_d.model.distribution.num_params):]
+    # --- 3. Estimate Copulas ---
+    copulas = estimate_copulas(u_hist, config)
 
+    # --- 4. Forecast ---
+    fc_s = res_s.forecast(reindex=False)
+    fc_d = res_d.forecast(reindex=False)
+    
+    μs, σs = fc_s.mean.iloc[-1, 0], np.sqrt(fc_s.variance.iloc[-1, 0])
+    μd, σd = fc_d.mean.iloc[-1, 0], np.sqrt(fc_d.variance.iloc[-1, 0])
+    
+    dist_s = res_s.model.distribution
+    params_s = res_s.params[dist_s.parameter_names()].values
+
+    dist_d = res_d.model.distribution
+    params_d = res_d.params[dist_d.parameter_names()].values
+
+    # --- 5. Simulate and Calculate VaR/ES ---
     samplers = {
-        "Gaussian": lambda n: gauss_copula(n, cop["Gaussian"]["corr_matrix"]),
-        "StudentT": lambda n: t_copula(n, cop["StudentT"]["corr_matrix"], cop["StudentT"]["df"]),
-        "Clayton" : lambda n: clayton_copula(n, cop["Clayton"]["theta"]),
-        "Gumbel"  : lambda n: surv_gumbel(n, cop["Gumbel"]["theta"]),
+        "Gaussian": lambda n: gauss_copula(n, copulas["Gaussian"]["corr_matrix"]),
+        "StudentT": lambda n: t_copula(n, copulas["StudentT"]["corr_matrix"], copulas["StudentT"]["df"]),
+        "Clayton" : lambda n: clayton_copula(n, copulas["Clayton"]["theta"]),
+        "Gumbel"  : lambda n: surv_gumbel(n, copulas["Gumbel"]["theta"]),
     }
 
     out = {}
     for name, gen in samplers.items():
-        w_s, w_d = min_var_w(σs, σd, cop[name]["rho"])
+        w_s, w_d = min_var_w(σs, σd, copulas[name]["rho"])
         u = gen(config['sims'])
-        
-        ret_s = μs + σs * _ppf(u[:, 0], fit_s.model.distribution.name, params_s)
-        ret_d = μd + σd * _ppf(u[:, 1], fit_d.model.distribution.name, params_d)
+
+        # Use the distribution's own .ppf() method for accurate simulation
+        innov_s = dist_s.ppf(u[:, 0], params_s)
+        innov_d = dist_d.ppf(u[:, 1], params_d)
+
+        ret_s = μs + σs * innov_s
+        ret_d = μd + σd * innov_d
         port = (w_s * ret_s + w_d * ret_d)[np.isfinite(ret_s) & np.isfinite(ret_d)]
         
         if port.size < 50: VaR, ES = np.nan, np.nan
@@ -282,6 +302,7 @@ def run_backtest(frc_df, act_df, alpha):
         }
     return results
 
+
 # ============================================================================ #
 # 5. MAIN EXECUTION & TUNING LOOP
 # ============================================================================ #
@@ -291,8 +312,14 @@ def main():
     print("=" * 80)
     print(">>> SCRIPT 3 (FINAL): AUTOMATED GARCH-COPULA TUNING & FORECASTING <<<")
     
-    u_df = pd.read_csv("copula_input_data.csv", index_col=0, parse_dates=True)
-    full_df = pd.read_csv("spx_dax_daily_data.csv", index_col=0, parse_dates=True)
+    # --- Path setup ---
+    FULL_DATA_DIR   = "CC/data"
+    INPUT_DATA_DIR  = "CC/model"
+    RESULTS_DIR     = "CC/simulation"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    
+    u_df = pd.read_csv(f"{INPUT_DATA_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
+    full_df = pd.read_csv(f"{FULL_DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
     dates_to_forecast = full_df.loc[OOS_START_DATE:].index
     
     tuning_results = []
@@ -300,9 +327,16 @@ def main():
     
     print(f"\n--- Starting Hyperparameter Tuning for {len(param_combinations)} combinations ---")
     
+    # --- Generator to create tasks for the parallel pool ---
+    def task_generator(dates, config):
+        for date in dates:
+            # Yield only the minimal, stable data needed by the worker
+            yield delayed(one_day_forecast)(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES)
+
+    # --- Main Tuning Loop ---
     for i, params in enumerate(param_combinations):
         config = {
-            "refit_freq": params['refit_freq'],
+            "refit_freq": params['refit_freq'], # Note: refit_freq is no longer used but kept for consistency
             "beta_cap": params['beta_cap'],
             "tail_adj": params['tail_adj'],
             "sims": SIMS_PER_DAY,
@@ -310,35 +344,22 @@ def main():
         }
         print(f"\n[{i+1}/{len(param_combinations)}] Testing params: {config}")
 
-        # Reset global cache for each run to ensure independence
-        global _last_idx, _cache_spx, _cache_dax
-        _last_idx, _cache_spx, _cache_dax = -999, None, None
-        
-        copulas = estimate_copulas(u_df, config)
-        
+        tasks = task_generator(dates_to_forecast, config)
         forecasts = Parallel(n_jobs=N_JOBS)(
-            delayed(one_day_forecast)(d, full_df, copulas, config) for d in tqdm(dates_to_forecast, desc="Rolling Forecast"))
+            tqdm(tasks, desc="Rolling Forecast", total=len(dates_to_forecast))
+        )
         
         forecast_df = pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
-        
         backtest_results = run_backtest(forecast_df, full_df, config['alpha'])
         
-        # Store results for each copula model under this parameter set
         for model_name, metrics in backtest_results.items():
-            tuning_results.append({
-                "params": str(config),
-                "model": model_name,
-                **metrics
-            })
+            tuning_results.append({ "params": str(config), "model": model_name, **metrics })
             
     # --- Analyze Tuning Results and Find Best Parameters ---
     results_df = pd.DataFrame(tuning_results)
     print("\n\n--- Hyperparameter Tuning Results Summary ---")
     print(results_df.to_markdown(index=False, floatfmt=".4f"))
     
-    # Selection criteria:
-    # 1. Must pass both backtests (p-value > 0.05)
-    # 2. Among those that pass, choose the one with the smallest absolute breach error
     valid_models = results_df[(results_df['kupiec_p'] > 0.05) & (results_df['christoffersen_p'] > 0.05)].copy()
     
     if valid_models.empty:
@@ -353,24 +374,36 @@ def main():
     
     # --- Perform Final Run with Best Parameters ---
     best_params_str = best_model_run['params']
-    best_config = eval(best_params_str) # Convert string back to dict
+    best_config = eval(best_params_str)
     print(f"\n--- Performing final run with optimal parameters: {best_config} ---")
     
-    _last_idx, _cache_spx, _cache_dax = -999, None, None # Reset cache
-    
-    final_copulas = estimate_copulas(u_df, best_config)
+    final_tasks_gen = task_generator(dates_to_forecast, best_config)
     final_forecasts = Parallel(n_jobs=N_JOBS)(
-        delayed(one_day_forecast)(d, full_df, final_copulas, best_config) for d in tqdm(dates_to_forecast, desc="Final Forecast"))
+        tqdm(final_tasks_gen, desc="Final Forecast", total=len(dates_to_forecast))
+    )
         
     final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
     
-    final_df.to_csv("garch_copula_all_results_TUNED.csv", float_format="%.6f")
-    with open("copula_params_TUNED.pkl", "wb") as fh: pickle.dump(final_copulas, fh)
+    tuned_results_path = f"{RESULTS_DIR}/garch_copula_all_results_TUNED.csv"
+    tuned_params_path = f"{RESULTS_DIR}/copula_params_TUNED.pkl"
+    final_df.to_csv(tuned_results_path, float_format="%.6f")
+
+    final_copulas = estimate_copulas(u_df, best_config)
+    with open(tuned_params_path, "wb") as fh: pickle.dump(final_copulas, fh)
+    with open("CC/simulation/best_config.pkl", "wb") as f:
+        pickle.dump(best_config, f)
+
     
-    print("\nSaved final tuned forecasts → garch_copula_all_results_TUNED.csv")
-    print("Saved final tuned copula params → copula_params_TUNED.pkl")
+    print(f"\nSaved final tuned forecasts → {tuned_results_path}")
+    print(f"Saved final tuned copula params → {tuned_params_path}")
     print("="*80)
     print(">>> Process finished successfully. <<<")
 
+    import pickle
+
+    with open("CC/simulation/best_config.pkl", "wb") as f:
+        pickle.dump(best_config, f)
+
 if __name__ == "__main__":
     main()
+

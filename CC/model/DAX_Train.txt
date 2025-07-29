@@ -9,7 +9,7 @@ Distribution:      Generalized Error Distribution   AIC:                        
 Method:                        Maximum Likelihood   BIC:                           11475.7
                                                     No. Observations:                 3639
 Date:                            Tue, Jul 29 2025   Df Residuals:                     3638
-Time:                                    19:26:11   Df Model:                            1
+Time:                                    21:58:24   Df Model:                            1
                                 Mean Model                                
 ==========================================================================
                  coef    std err          t      P>|t|    95.0% Conf. Int.
