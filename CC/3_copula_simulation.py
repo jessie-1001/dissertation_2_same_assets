@@ -32,9 +32,9 @@ from tqdm import tqdm
 # --- Hyperparameter Grid for Tuning ---
 # NOTE: A larger grid will be more thorough but take much longer to run.
 PARAM_GRID = {
-    "refit_freq": [63],         # [30, 63, 126] - How often to re-estimate GARCH models (in days)
-    "beta_cap":   [0.90, 0.95], # [0.85, 0.90, 0.95] - Cap on GARCH persistence parameter
-    "tail_adj":   [1.0, 1.3],   # [1.0, 1.3, 1.5] - Multiplier for copula tail dependence
+    "refit_freq": [30, 63],         # [30, 63, 126] - How often to re-estimate GARCH models (in days)
+    "beta_cap":   [0.85, 0.90, 0.95], # [0.85, 0.90, 0.95] - Cap on GARCH persistence parameter
+    "tail_adj":   [1.0, 1.3, 1.5],   # [1.0, 1.3, 1.5] - Multiplier for copula tail dependence
 }
 
 # --- GARCH Model Specifications ---
@@ -183,21 +183,45 @@ def fit_best_garch(series: pd.Series, tag: str, config: dict):
 def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
     """
     Performs a completely self-contained 1-day ahead forecast for a given date.
-    This function is designed to be run in a separate process.
+    This function is designed to be run in a separate process and now includes
+    caching to avoid re-fitting GARCH models unnecessarily.
     """
+    # --- MODIFICATION START: Access and modify global cache variables ---
+    global _last_idx, _cache_spx, _cache_dax
+    # --- MODIFICATION END ---
+
     # --- 1. Data Preparation ---
     idx = full_df.index.get_loc(date)
-    hist_df = full_df.iloc[:idx + 1]
-    u_hist = u_df.loc[u_df.index < date] # Use pre-calculated PITs for copula fitting
+    # Use pre-calculated PITs for copula fitting
+    u_hist = u_df.loc[u_df.index < date] 
 
-    # --- 2. Fit Marginal GARCH Models ---
-    res_s, _, _, _ = fit_best_garch(hist_df["SPX_Return"], "SPX", config)
-    res_d, _, _, _ = fit_best_garch(hist_df["DAX_Return"], "DAX", config)
+    # --- MODIFICATION START: Caching logic for GARCH models ---
+    # Calculate a key based on the current index and refit frequency.
+    # All days within the same frequency window will have the same key.
+    refit_key = idx // config['refit_freq']
 
-    # --- 3. Estimate Copulas ---
+    # If the key is new, refit the GARCH models and update the cache.
+    if refit_key != _last_idx:
+        hist_df_for_garch = full_df.iloc[:idx + 1]
+        
+        # Fit, update cache, and update the last index key
+        res_s, _, _, _ = fit_best_garch(hist_df_for_garch["SPX_Return"], "SPX", config)
+        res_d, _, _, _ = fit_best_garch(hist_df_for_garch["DAX_Return"], "DAX", config)
+        
+        _cache_spx = res_s
+        _cache_dax = res_d
+        _last_idx = refit_key
+    # If the key is the same as the last one, use the cached models.
+    else:
+        res_s = _cache_spx
+        res_d = _cache_dax
+    # --- MODIFICATION END ---
+    
+    # --- 2. Estimate Copulas ---
+    # This is still done daily as the historical PIT window grows each day.
     copulas = estimate_copulas(u_hist, config)
 
-    # --- 4. Forecast ---
+    # --- 3. Forecast ---
     fc_s = res_s.forecast(reindex=False)
     fc_d = res_d.forecast(reindex=False)
     
@@ -210,7 +234,7 @@ def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
     dist_d = res_d.model.distribution
     params_d = res_d.params[dist_d.parameter_names()].values
 
-    # --- 5. Simulate and Calculate VaR/ES ---
+    # --- 4. Simulate and Calculate VaR/ES ---
     samplers = {
         "Gaussian": lambda n: gauss_copula(n, copulas["Gaussian"]["corr_matrix"]),
         "StudentT": lambda n: t_copula(n, copulas["StudentT"]["corr_matrix"], copulas["StudentT"]["df"]),
@@ -384,7 +408,7 @@ def main():
         
     final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
     
-    tuned_results_path = f"{RESULTS_DIR}/garch_copula_all_results_TUNED.csv"
+    tuned_results_path = f"{RESULTS_DIR}/garch_copula_all_results.csv"
     tuned_params_path = f"{RESULTS_DIR}/copula_params_TUNED.pkl"
     final_df.to_csv(tuned_results_path, float_format="%.6f")
 
@@ -398,11 +422,6 @@ def main():
     print(f"Saved final tuned copula params → {tuned_params_path}")
     print("="*80)
     print(">>> Process finished successfully. <<<")
-
-    import pickle
-
-    with open("CC/simulation/best_config.pkl", "wb") as f:
-        pickle.dump(best_config, f)
 
 if __name__ == "__main__":
     main()
