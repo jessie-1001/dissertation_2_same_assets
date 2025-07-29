@@ -24,9 +24,10 @@ import seaborn as sns
 
 
 # --- 1. Configuration ---
-DATA_FILE       = "spx_dax_daily_data.csv"
+DATA_DIR        = "CC/data"
+RESULTS_DIR     = "CC/model"
+DATA_FILE       = f"{DATA_DIR}/spx_dax_daily_data.csv"
 IN_SAMPLE_RATIO = 0.80  # 80% for training, 20% for testing
-RESULTS_DIR     = "model_logs"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 VOL_FAMILIES = {
@@ -384,10 +385,11 @@ def main():
     all_summaries.extend(summary_train)
     
     # Generate PIT for copula modeling (training set only)
+    copula_input_data_path = f"{RESULTS_DIR}/copula_input_data.csv"
     pd.concat([
         pit_series(res_train["SPX"], train_data["SPX_Return"]),
         pit_series(res_train["DAX"], train_data["DAX_Return"])
-    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1).to_csv("copula_input_data.csv")
+    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1).to_csv(copula_input_data_path)
     print("Training set PIT saved → copula_input_data.csv")
 
     # ====================== STAGE 2: FULL SAMPLE MODELING ======================
@@ -398,10 +400,11 @@ def main():
     all_summaries.extend(summary_full)
 
     # Generate PIT for copula modeling (full sample)
+    copula_full_data_path = f"{RESULTS_DIR}/copula_input_data_full.csv"
     pd.concat([
         pit_series(res_full["SPX"], data["SPX_Return"]),
         pit_series(res_full["DAX"], data["DAX_Return"])
-    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1).to_csv("copula_input_data_full.csv")
+    ], axis=1).set_axis(["u_spx", "u_dax"], axis=1).to_csv(copula_full_data_path)
     print("Full sample PIT saved → copula_input_data_full.csv")
 
     # ====================== FINAL SUMMARY ======================
