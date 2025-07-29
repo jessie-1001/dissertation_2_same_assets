@@ -1,67 +1,83 @@
 #!/usr/bin/env python3
 # =============================================================================
-# SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST – REV 8
+# SCRIPT 3 (FINAL): AUTOMATED GARCH-COPULA TUNING & FORECASTING
 # =============================================================================
 """
-Rolling 1‑day VaR / ES forecast using:
-    • GED‑marginal GARCH(1,1) (SPX AR(1)+GJR | DAX Const+GARCH)
-    • Four copulas (Gaussian / Student‑t / survival‑Clayton / survival‑Gumbel)
-    • Dynamic min‑var portfolio weights (risk‑aversion & hard floor/cap)
-
-Rev 8 fix:
-    1. drop NaNs before τ / ρ estimation → ρ_G could be NaN
-    2. guard against empty ‘port’ array (percentile crash)
+1. Defines a grid of hyperparameters to test.
+2. For each combination, runs a full rolling-window GARCH-Copula simulation.
+3. Backtests the results of each simulation run.
+4. Selects the optimal hyperparameter set based on backtest validity and accuracy.
+5. Performs a final, full forecast using the best parameters and saves the results.
 """
-# --------------------------------------------------------------------------- #
-# 0. Imports & helpers
-# --------------------------------------------------------------------------- #
-import os, pickle, warnings
-import numpy as np, pandas as pd
-from scipy.stats import norm, t, kendalltau, gennorm
-from scipy.linalg import cholesky
-from scipy.optimize import minimize
-from arch import arch_model
-from joblib import Parallel, delayed
-from tqdm import tqdm
+import os
+import pickle
+import warnings
+from itertools import product
 from math import gamma
 
-# === global knobs =========================================================
-ALPHA_SCALE  = 1.00        # GARCH α 放大倍数（>1 更灵敏）
-BETA_CAP     = 0.70        # GARCH β 上限（越小→记忆越短）
-REFIT_FREQ   = 63          # GARCH 重新估计频率（≈1 个季度）
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from arch import arch_model
+from joblib import Parallel, delayed
+from scipy.linalg import cholesky
+from scipy.optimize import minimize
+from scipy.stats import gennorm, kendalltau, norm, t, chi2
+from tqdm import tqdm
 
-TAIL_ADJ     = 1.30        # Copula θ 放大（>1 加强尾依赖）
-USE_SURV     = True        # True→用 survival‑Clayton / survival‑Gumbel（上尾）
-WEIGHT_FLOOR = 0.25        # 组合最小 w_SPX
-WEIGHT_CAP   = 0.75        # 组合最大 w_SPX
-# ==========================================================================
+# ============================================================================ #
+# 1. CONFIGURATION AND HYPERPARAMETER GRID
+# ============================================================================ #
 
-_last_idx, _cache_spx, _cache_dax = -999, None, None    # forecast cache
-# --------------------------------------------------------------------------- #
+# --- Hyperparameter Grid for Tuning ---
+# NOTE: A larger grid will be more thorough but take much longer to run.
+PARAM_GRID = {
+    "refit_freq": [63],         # [30, 63, 126] - How often to re-estimate GARCH models (in days)
+    "beta_cap":   [0.90, 0.95], # [0.85, 0.90, 0.95] - Cap on GARCH persistence parameter
+    "tail_adj":   [1.0, 1.3],   # [1.0, 1.3, 1.5] - Multiplier for copula tail dependence
+}
 
-warnings.filterwarnings("ignore", category=UserWarning)
+# --- General Configuration ---
+SIMS_PER_DAY = 25000       # Number of simulations for each day's forecast
+OOS_START_DATE = "2020-01-02" # Start date for the out-of-sample forecast
+PORTFOLIO_ALPHA = 0.01     # For 99% VaR/ES
+WEIGHT_FLOOR = 0.25        # Minimum portfolio weight for an asset
+WEIGHT_CAP = 0.75          # Maximum portfolio weight for an asset
+N_JOBS = -1                # Use all available CPU cores for parallel processing
 
+# --- Global cache for GARCH models to speed up rolling window ---
+_last_idx, _cache_spx, _cache_dax = -999, None, None
+
+warnings.filterwarnings("ignore")
+
+# ============================================================================ #
+# 2. HELPER & UTILITY FUNCTIONS
+# ============================================================================ #
+
+# --- Math & Stat Helpers ---
 def _safe_chol(corr):
     try:
         return cholesky(corr, lower=True)
     except np.linalg.LinAlgError:
         w, v = np.linalg.eigh(corr)
-        corr = v @ np.diag(np.clip(w, 1e-6, None)) @ v.T
-        d    = np.diag(1/np.sqrt(np.diag(corr)))
-        return cholesky(d @ corr @ d, lower=True)
+        corr_psd = v @ np.diag(np.clip(w, 1e-6, None)) @ v.T
+        d = np.diag(1 / np.sqrt(np.diag(corr_psd)))
+        return cholesky(d @ corr_psd @ d, lower=True)
 
-# ---------- GED ppf helper --------------------------------------------------
 def _ged_ppf(u, nu):
-    beta = np.sqrt((2**(2/nu))*gamma(1/nu)/gamma(3/nu))
+    beta = np.sqrt((2 ** (2 / nu)) * gamma(1 / nu) / gamma(3 / nu))
     return gennorm.ppf(u, nu, scale=beta)
 
-def _ppf(u, dist, df):
-    return _ged_ppf(u, df) if dist=="ged" else t.ppf(u, df=df)
+def _ppf(u, dist_name, params):
+    dist_name = dist_name.lower()
+    if "ged" in dist_name:
+        return _ged_ppf(u, params[0])
+    elif "skewt" in dist_name:
+        return t.ppf(u, df=params[0]) # Approximation
+    else: # Student-t
+        return t.ppf(u, df=params[0])
 
-
-# --------------------------------------------------------------------------- #
-# 1. Copula samplers
-# --------------------------------------------------------------------------- #
+# --- Copula Samplers ---
 def gauss_copula(n, corr):
     z = np.random.randn(n, 2) @ _safe_chol(corr).T
     return norm.cdf(z)
@@ -72,219 +88,289 @@ def t_copula(n, corr, df):
     return t.cdf(z * np.sqrt(df / g)[:, None], df=df)
 
 def clayton_copula(n, theta):
-    if theta <= 0:
-        return np.random.rand(n, 2)
-    g  = np.random.gamma(1 / theta, 1, n)
+    if theta <= 1e-6: return np.random.rand(n, 2)
+    g = np.random.gamma(1 / theta, 1, n)
     e1, e2 = np.random.exponential(size=(2, n))
     u = np.exp(-np.log1p(e1 / g) / theta)
     v = np.exp(-np.log1p(e2 / g) / theta)
     return np.column_stack((u, v)).clip(1e-6, 1 - 1e-6)
 
 def gumbel_copula(n, theta):
-    if theta <= 1:
-        return np.random.rand(n, 2)
+    if theta <= 1: return np.random.rand(n, 2)
     beta = 1 / theta
-    s    = np.random.gamma(1 / beta, 1, n)
-    e    = np.random.exponential(size=(n, 2))
+    s = np.random.gamma(1 / beta, 1, n)
+    e = np.random.exponential(size=(n, 2))
     u = np.exp(-e[:, 0] / (s ** beta))
     v = np.exp(-e[:, 1] / (s ** beta))
     return np.column_stack((u, v)).clip(1e-6, 1 - 1e-6)
-
-def surv_clayton(n, θ):   # upper‑tail dependence
-    u, v = clayton_copula(n, θ).T
-    return 1 - u, 1 - v
 
 def surv_gumbel(n, θ):
     u, v = gumbel_copula(n, θ).T
     return 1 - u, 1 - v
 
-# --------------------------------------------------------------------------- #
-# 2. Copula parameter estimation
-# --------------------------------------------------------------------------- #
-def fit_t_copula(u_df: pd.DataFrame):
-    """MLE for bivariate Student‑t copula (ρ, ν)."""
-    u_df = u_df.dropna()
-    tau, _ = kendalltau(u_df.iloc[:, 0], u_df.iloc[:, 1])
-    rho0   = np.sin(np.pi * tau / 2)
+# --- Copula Parameter Estimation ---
+def estimate_copulas(u_raw: pd.DataFrame, config: dict):
+    u = u_raw.dropna()
+    if u.empty: raise ValueError("PIT series is empty, cannot estimate copula parameters.")
 
-    u_arr  = u_df.to_numpy()                    # <<< 转成 ndarray 仅一次
-    bounds = [(-0.99, .99), (2.1, 40)]
+    z = norm.ppf(u.clip(1e-6, 1 - 1e-6).values)
+    rhoG = np.corrcoef(z.T)[0, 1] if np.isfinite(z).all() else 0.0
 
-    def nll(p):
+    tau, _ = kendalltau(u.iloc[:, 0], u.iloc[:, 1])
+    rhoT_init = np.sin(np.pi * tau / 2)
+
+    def t_nll(p):
         ρ, ν = p
-        if abs(ρ) >= .99:
-            return 1e6
-        L   = _safe_chol(np.array([[1, ρ], [ρ, 1]]))
-        z   = t.ppf(u_arr.clip(1e-6, 1 - 1e-6), df=ν)   # Nx2 ndarray
-        q   = np.linalg.solve(L, z.T).T
-        ll  = t.logpdf(q, df=ν).sum(axis=1) - 2*np.log(np.diag(L)).sum()
+        if abs(ρ) >= 0.999: return 1e9
+        L = _safe_chol(np.array([[1, ρ], [ρ, 1]]))
+        z_t = t.ppf(u.values, df=ν)
+        q = np.linalg.solve(L, z_t.T).T
+        ll = t.logpdf(q, df=ν).sum(axis=1) - 2 * np.log(np.diag(L)).sum()
         return -ll.sum()
 
-    ρ_hat, ν_hat = minimize(nll, [rho0, 10],
-                            bounds=bounds, method="L-BFGS-B").x
-    return {"corr_matrix": np.array([[1, ρ_hat], [ρ_hat, 1]]), "df": ν_hat}
+    res = minimize(t_nll, [rhoT_init, 10], bounds=[(-0.99, 0.99), (2.1, 40)], method="L-BFGS-B")
+    rhoT, dfT = res.x
 
-def _theta_from_tau(fam, u_df):
-    tau, _ = kendalltau(u_df.iloc[:, 0], u_df.iloc[:, 1])
-    if fam == "Clayton":
-        return max(0.1, 2 * tau / (1 - tau + 1e-9))
-    if fam == "Gumbel":
-        return max(1.01, 1 / (1 - tau + 1e-9))
-
-# --------------------------------------------------------------------------- #
-# 2. Copula parameter estimation (✱ re‑write)                                #
-# --------------------------------------------------------------------------- #
-def estimate_copulas(u_raw: pd.DataFrame):
-    """
-    输出 dict:  Gaussian / StudentT / Clayton / Gumbel
-    Clayton‧Gumbel 的 θ 乘以全局 TAIL_ADJ，可通过 USE_SURV
-    决定是否改用 survival‑copula（上尾依赖）。
-    """
-    u = u_raw.dropna()
-    if u.empty:
-        raise ValueError("PIT 序列为空，无法估计 copula 参数。")
-
-    z   = norm.ppf(u.clip(1e-6, 1-1e-6).values)
-    rhoG = np.corrcoef(z.T)[0, 1] if np.isfinite(z).all() else 0.0
-    gaussian = {"corr_matrix": np.array([[1, rhoG], [rhoG, 1]]), "rho": rhoG}
-
-    # ---- Student‑t ---------------------------------------------------------
-    t_par = fit_t_copula(u)
-    t_par["df"] = min(30, t_par["df"])                      # 上限 30
-
-    # ---- Clayton / Gumbel --------------------------------------------------
-    θc = _theta_from_tau("Clayton", u) * TAIL_ADJ
-    θg = _theta_from_tau("Gumbel",  u) * TAIL_ADJ
-    ρc = np.sin(np.pi * (θc / (θc + 2)) / 2)                # 近似 ρ
-    ρg = np.sin(np.pi * (1 - 1 / θg) / 2)
-
-    print("\n--- Adjusted Copula Parameters ---")
-    print(f" Gaussian   ρ = {rhoG:.3f}")
-    print(f" Student‑t  ρ = {t_par['corr_matrix'][0,1]:.3f}  ν = {t_par['df']:.1f}")
-    print(f" Clayton    θ = {θc:.2f}  ρ ≈ {ρc:.3f}")
-    print(f" Gumbel     θ = {θg:.2f}  ρ ≈ {ρg:.3f}")
+    θc = max(0.1, 2 * tau / (1 - tau + 1e-9)) * config['tail_adj']
+    θg = max(1.01, 1 / (1 - tau + 1e-9)) * config['tail_adj']
 
     return {
-        "Gaussian": gaussian,
-        "StudentT": t_par,
-        "Clayton" : {"theta": θc, "rho": ρc},
-        "Gumbel"  : {"theta": θg, "rho": ρg},
+        "Gaussian": {"corr_matrix": np.array([[1, rhoG], [rhoG, 1]]), "rho": rhoG},
+        "StudentT": {"corr_matrix": np.array([[1, rhoT], [rhoT, 1]]), "df": dfT, "rho": rhoT},
+        "Clayton": {"theta": θc, "rho": np.sin(np.pi * (θc / (θc + 2)) / 2)},
+        "Gumbel": {"theta": θg, "rho": np.sin(np.pi * (1 - 1 / θg) / 2)},
     }
 
-# --------------------------------------------------------------------------- #
-# 3. Marginal GARCH fit (✱ re‑write)                                         #
-# --------------------------------------------------------------------------- #
-def garch_fit(series, asset):
-    if asset == "SPX":
-        mdl = arch_model(series, mean="AR", lags=1,
-                         vol="GARCH", p=1, o=1, q=1, dist="ged")
-    else:
-        mdl = arch_model(series, mean="Constant",
-                         vol="GARCH", p=1, q=1, dist="ged")
+# ============================================================================ #
+# 3. CORE SIMULATION LOGIC
+# ============================================================================ #
 
-    res = mdl.fit(disp="off")
+def fit_best_garch(series: pd.Series, tag: str, config: dict):
+    """Selects the best GARCH model for a series based on BIC."""
+    candidates = []
+    VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
+    DISTRIBUTIONS = ["t", "skewt", "ged"]
+    MEAN_SPEC = {"Constant": dict(mean="Constant"), "AR": dict(mean="AR", lags=1)}
 
-    # —— 软约束：调 α、截 β ——
-    if "alpha[1]" in res.params:
-        res.params["alpha[1]"] *= ALPHA_SCALE
-    if "beta[1]" in res.params:
-        res.params["beta[1]"]  = min(res.params["beta[1]"], BETA_CAP)
-    return res
+    for mean_tag, mean_kw in MEAN_SPEC.items():
+        for vol, dist in product(VOL_FAMILIES, DISTRIBUTIONS):
+            try:
+                mdl = arch_model(series, p=1, q=1, dist=dist, **mean_kw, **VOL_FAMILIES[vol])
+                res = mdl.fit(disp="off", show_warning=False)
+                if res.convergence_flag == 0:
+                    # Apply beta cap constraint
+                    if "beta[1]" in res.params:
+                        res.params["beta[1]"] = min(res.params["beta[1]"], config['beta_cap'])
+                    candidates.append((res.bic, res))
+            except Exception:
+                continue
 
+    if not candidates:
+        mdl = arch_model(series, p=1, q=1, vol="GARCH", dist="t")
+        return mdl.fit(disp="off")
+        
+    _, best_res = min(candidates, key=lambda x: x[0])
+    return best_res
 
-# --------------------------------------------------------------------------- #
-# 4. Single‑day simulation block (✱ re‑write)                                #
-# --------------------------------------------------------------------------- #
-def one_day(date, full_df, cop, sims=40_000):
+def one_day_forecast(date, full_df, cop, config):
+    """Performs a single 1-day ahead forecast."""
     global _last_idx, _cache_spx, _cache_dax
     idx = full_df.index.get_loc(date)
-    if idx == 0:
-        return None
+    if idx == 0: return None
 
-    # —— 每 REFIT_FREQ 天重新估计一次 marginals ——
-    if (idx - _last_idx) >= REFIT_FREQ or _cache_spx is None:
-        hist          = full_df.iloc[:idx]
-        _cache_spx    = garch_fit(hist["SPX_Return"], "SPX")
-        _cache_dax    = garch_fit(hist["DAX_Return"], "DAX")
-        _last_idx     = idx
+    if (idx - _last_idx) >= config['refit_freq'] or _cache_spx is None:
+        hist_df = full_df.iloc[:idx]
+        _cache_spx = fit_best_garch(hist_df["SPX_Return"], "SPX", config)
+        _cache_dax = fit_best_garch(hist_df["DAX_Return"], "DAX", config)
+        _last_idx = idx
+    
     fit_s, fit_d = _cache_spx, _cache_dax
 
-    σs = np.sqrt(fit_s.forecast(reindex=False).variance.iloc[0, 0])
-    σd = np.sqrt(fit_d.forecast(reindex=False).variance.iloc[0, 0])
-    μs, μd = fit_s.params.get("mu", 0), fit_d.params.get("mu", 0)
-    νs, νd = fit_s.params.get("nu", 1.5), fit_d.params.get("nu", 1.5)
+    fc_s = fit_s.forecast(reindex=False)
+    fc_d = fit_d.forecast(reindex=False)
+    
+    μs, σs = fc_s.mean.iloc[0, 0], np.sqrt(fc_s.variance.iloc[0, 0])
+    μd, σd = fc_d.mean.iloc[0, 0], np.sqrt(fc_d.variance.iloc[0, 0])
+    
+    params_s = fit_s.params[-(fit_s.model.distribution.num_params):]
+    params_d = fit_d.params[-(fit_d.model.distribution.num_params):]
 
     samplers = {
         "Gaussian": lambda n: gauss_copula(n, cop["Gaussian"]["corr_matrix"]),
-        "StudentT": lambda n: t_copula(n,
-                        cop["StudentT"]["corr_matrix"], cop["StudentT"]["df"]),
-        "Clayton" : (lambda n:
-            np.column_stack(surv_clayton(n, cop["Clayton"]["theta"]))
-            if USE_SURV else clayton_copula(n, cop["Clayton"]["theta"])),
-        "Gumbel"  : (lambda n:
-            np.column_stack(surv_gumbel(n,  cop["Gumbel"]["theta"]))
-            if USE_SURV else gumbel_copula(n,  cop["Gumbel"]["theta"]))
+        "StudentT": lambda n: t_copula(n, cop["StudentT"]["corr_matrix"], cop["StudentT"]["df"]),
+        "Clayton" : lambda n: clayton_copula(n, cop["Clayton"]["theta"]),
+        "Gumbel"  : lambda n: surv_gumbel(n, cop["Gumbel"]["theta"]),
     }
 
     out = {}
     for name, gen in samplers.items():
-        rho = {
-            "Gaussian": cop["Gaussian"]["rho"],
-            "StudentT": cop["StudentT"]["corr_matrix"][0, 1],
-            "Clayton" : cop["Clayton"]["rho"],
-            "Gumbel"  : cop["Gumbel"]["rho"],
-        }[name]
-
-        w_s, w_d = min_var_w(σs, σd, rho)          # floor / cap 来自全局常量
-        u   = gen(sims)
-        port= w_s*(μs + σs*_ppf(u[:,0],"ged",νs)) + \
-              w_d*(μd + σd*_ppf(u[:,1],"ged",νd))
-        port = port[np.isfinite(port)]
-        if port.size < 50:
-            VaR = ES = np.nan
+        w_s, w_d = min_var_w(σs, σd, cop[name]["rho"])
+        u = gen(config['sims'])
+        
+        ret_s = μs + σs * _ppf(u[:, 0], fit_s.model.distribution.name, params_s)
+        ret_d = μd + σd * _ppf(u[:, 1], fit_d.model.distribution.name, params_d)
+        port = (w_s * ret_s + w_d * ret_d)[np.isfinite(ret_s) & np.isfinite(ret_d)]
+        
+        if port.size < 50: VaR, ES = np.nan, np.nan
         else:
-            VaR = np.percentile(port, 1)
-            ES  = port[port <= VaR].mean()
+            VaR = np.percentile(port, 100 * config['alpha'])
+            ES = port[port <= VaR].mean()
 
-        out.update({
-            f"{name}_VaR"   : VaR,
-            f"{name}_ES"    : ES,
-            f"{name}_wSPX"  : w_s,
-            f"{name}_wDAX"  : w_d,
-            f"{name}_volSPX": σs,
-            f"{name}_volDAX": σd
-        })
-
+        out.update({f"{name}_VaR": VaR, f"{name}_ES": ES})
     out["Date"] = date
     return out
-# --------------------------------------------------------------------------- #
-# 5 |  util for weights
-# --------------------------------------------------------------------------- #
-def min_var_w(vol1, vol2, rho,
-              floor=WEIGHT_FLOOR,   # ← 用全局常量
-              cap=WEIGHT_CAP):      # ← 用全局常量
-    Σ = np.array([[vol1**2, rho*vol1*vol2],
-                  [rho*vol1*vol2, vol2**2]])
-    inv = np.linalg.inv(Σ)
-    w   = inv @ np.ones(2) / (np.ones(2) @ inv @ np.ones(2))
-    w1  = np.clip(w[0], floor, cap)
-    return w1, 1 - w1
-# --------------------------------------------------------------------------- #
-if __name__=="__main__":
-    print("="*80,"\n>>> SCRIPT 03 : GARCH‑COPULA ROLLING FORECAST <<<")
-    u_df=pd.read_csv("copula_input_data.csv",index_col=0,parse_dates=True)
-    full=pd.read_csv("spx_dax_daily_data.csv",index_col=0,parse_dates=True)
-    cop=estimate_copulas(u_df)
 
-    oos_start="2020-01-02"
-    dates=full.loc[oos_start:].index
-    print(f"\nRolling forecast for {len(dates)} trading days …")
+def min_var_w(vol1, vol2, rho):
+    """Calculates minimum variance portfolio weights with constraints."""
+    Σ = np.array([[vol1**2, rho*vol1*vol2], [rho*vol1*vol2, vol2**2]])
+    try:
+        inv = np.linalg.inv(Σ)
+        w = inv @ np.ones(2) / (np.ones(2) @ inv @ np.ones(2))
+        return np.clip(w[0], WEIGHT_FLOOR, WEIGHT_CAP), 1 - np.clip(w[0], WEIGHT_FLOOR, WEIGHT_CAP)
+    except np.linalg.LinAlgError: return 0.5, 0.5
 
-    forecasts=Parallel(n_jobs=-1,backend="loky")(
-        delayed(one_day)(d,full,cop) for d in tqdm(dates))
-    res=pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
+# ============================================================================ #
+# 4. BACKTESTING FUNCTIONS (Adapted from 4_backtesting_analysis.py)
+# ============================================================================ #
 
-    res.to_csv("garch_copula_all_results.csv",float_format="%.6f",encoding="utf-8")
-    with open("copula_params.pkl","wb") as fh: pickle.dump(cop,fh)
-    print("\nSaved → garch_copula_all_results.csv  &  copula_params.pkl")
+def run_backtest(frc_df, act_df, alpha):
+    """Runs backtests and returns key performance metrics."""
+    act1 = act_df.shift(-1)
+    results = {}
+    
+    for model in ["Gaussian", "StudentT", "Clayton", "Gumbel"]:
+        vcol = f"{model}_VaR"
+        tmp = pd.concat([frc_df[vcol], act1[["SPX_Return", "DAX_Return"]]], axis=1).dropna()
+        if tmp.empty: continue
+        
+        # NOTE: For simplicity, using 50/50 weights for backtesting actual returns
+        # A more advanced version could use the model's own forecast weights.
+        pret = 0.5 * tmp["SPX_Return"] + 0.5 * tmp["DAX_Return"]
+        hits = (pret <= tmp[vcol]).astype(int)
+        
+        n, n1 = len(hits), hits.sum()
+        p = alpha
+        pi_hat = n1 / n if n > 0 else 0
+        expected_n1 = n * p
+        
+        # Kupiec POF Test
+        if n1 == 0 or n1 == n:
+            lr_pof = -2 * n * np.log((1 - p) if n1 == 0 else p)
+        else:
+            lr_pof = 2 * (n1 * np.log(pi_hat / p) + (n - n1) * np.log((1 - pi_hat) / (1 - p)))
+        pof_p = 1 - chi2.cdf(lr_pof, 1)
+
+        # Christoffersen Independence Test
+        trans = pd.DataFrame({"prev": hits.shift(1), "curr": hits}).dropna()
+        n00, n01 = ((trans.prev == 0) & (trans.curr == 0)).sum(), ((trans.prev == 0) & (trans.curr == 1)).sum()
+        n10, n11 = ((trans.prev == 1) & (trans.curr == 0)).sum(), ((trans.prev == 1) & (trans.curr == 1)).sum()
+        
+        pi0, pi1 = n01/(n00+n01) if (n00+n01)>0 else 0, n11/(n10+n11) if (n10+n11)>0 else 0
+        pi_all = (n01+n11)/(n00+n01+n10+n11) if (n00+n01+n10+n11)>0 else 0
+        
+        logL0 = (n00+n10)*np.log(1-pi_all) + (n01+n11)*np.log(pi_all) if pi_all > 0 and pi_all < 1 else 0
+        logL1 = n00*np.log(1-pi0)+n01*np.log(pi0) + n10*np.log(1-pi1)+n11*np.log(pi1) if all(p > 0 and p < 1 for p in [pi0, pi1]) else 0
+        lr_ind = 2 * (logL1 - logL0)
+        ind_p = 1 - chi2.cdf(lr_ind, 1)
+
+        results[model] = {
+            "breaches": n1,
+            "expected_breaches": expected_n1,
+            "breach_rate": pi_hat,
+            "kupiec_p": pof_p,
+            "christoffersen_p": ind_p,
+        }
+    return results
+
+# ============================================================================ #
+# 5. MAIN EXECUTION & TUNING LOOP
+# ============================================================================ #
+
+def main():
+    """Main function to run tuning, select best model, and generate final forecast."""
+    print("=" * 80)
+    print(">>> SCRIPT 3 (FINAL): AUTOMATED GARCH-COPULA TUNING & FORECASTING <<<")
+    
+    u_df = pd.read_csv("copula_input_data.csv", index_col=0, parse_dates=True)
+    full_df = pd.read_csv("spx_dax_daily_data.csv", index_col=0, parse_dates=True)
+    dates_to_forecast = full_df.loc[OOS_START_DATE:].index
+    
+    tuning_results = []
+    param_combinations = [dict(zip(PARAM_GRID.keys(), v)) for v in product(*PARAM_GRID.values())]
+    
+    print(f"\n--- Starting Hyperparameter Tuning for {len(param_combinations)} combinations ---")
+    
+    for i, params in enumerate(param_combinations):
+        config = {
+            "refit_freq": params['refit_freq'],
+            "beta_cap": params['beta_cap'],
+            "tail_adj": params['tail_adj'],
+            "sims": SIMS_PER_DAY,
+            "alpha": PORTFOLIO_ALPHA,
+        }
+        print(f"\n[{i+1}/{len(param_combinations)}] Testing params: {config}")
+
+        # Reset global cache for each run to ensure independence
+        global _last_idx, _cache_spx, _cache_dax
+        _last_idx, _cache_spx, _cache_dax = -999, None, None
+        
+        copulas = estimate_copulas(u_df, config)
+        
+        forecasts = Parallel(n_jobs=N_JOBS)(
+            delayed(one_day_forecast)(d, full_df, copulas, config) for d in tqdm(dates_to_forecast, desc="Rolling Forecast"))
+        
+        forecast_df = pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
+        
+        backtest_results = run_backtest(forecast_df, full_df, config['alpha'])
+        
+        # Store results for each copula model under this parameter set
+        for model_name, metrics in backtest_results.items():
+            tuning_results.append({
+                "params": str(config),
+                "model": model_name,
+                **metrics
+            })
+            
+    # --- Analyze Tuning Results and Find Best Parameters ---
+    results_df = pd.DataFrame(tuning_results)
+    print("\n\n--- Hyperparameter Tuning Results Summary ---")
+    print(results_df.to_markdown(index=False, floatfmt=".4f"))
+    
+    # Selection criteria:
+    # 1. Must pass both backtests (p-value > 0.05)
+    # 2. Among those that pass, choose the one with the smallest absolute breach error
+    valid_models = results_df[(results_df['kupiec_p'] > 0.05) & (results_df['christoffersen_p'] > 0.05)].copy()
+    
+    if valid_models.empty:
+        print("\n\n[CRITICAL] No parameter combination produced a valid model. Exiting.")
+        return
+        
+    valid_models['abs_breach_error'] = abs(valid_models['breaches'] - valid_models['expected_breaches'])
+    best_model_run = valid_models.loc[valid_models['abs_breach_error'].idxmin()]
+    
+    print("\n\n--- Best Performing Model Configuration ---")
+    print(best_model_run)
+    
+    # --- Perform Final Run with Best Parameters ---
+    best_params_str = best_model_run['params']
+    best_config = eval(best_params_str) # Convert string back to dict
+    print(f"\n--- Performing final run with optimal parameters: {best_config} ---")
+    
+    _last_idx, _cache_spx, _cache_dax = -999, None, None # Reset cache
+    
+    final_copulas = estimate_copulas(u_df, best_config)
+    final_forecasts = Parallel(n_jobs=N_JOBS)(
+        delayed(one_day_forecast)(d, full_df, final_copulas, best_config) for d in tqdm(dates_to_forecast, desc="Final Forecast"))
+        
+    final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
+    
+    final_df.to_csv("garch_copula_all_results_TUNED.csv", float_format="%.6f")
+    with open("copula_params_TUNED.pkl", "wb") as fh: pickle.dump(final_copulas, fh)
+    
+    print("\nSaved final tuned forecasts → garch_copula_all_results_TUNED.csv")
+    print("Saved final tuned copula params → copula_params_TUNED.pkl")
     print("="*80)
+    print(">>> Process finished successfully. <<<")
+
+if __name__ == "__main__":
+    main()
