@@ -26,6 +26,7 @@ from scipy.stats import gennorm, kendalltau, norm, t, chi2
 from tqdm import tqdm
 import optuna
 
+from config import Config
 
 # ============================================================================ #
 # 1. CONFIGURATION AND HYPERPARAMETER GRID
@@ -336,16 +337,12 @@ def main():
     print("=" * 80)
     print(">>> SCRIPT 3 (FINAL): AUTOMATED GARCH-COPULA TUNING & FORECASTING <<<")
     
-    # --- Path setup ---
-    DATA_DIR   = "CC/data"
-    MODEL_DIR  = "CC/model"
-    SIMULATION_DIR     = "CC/simulation"
-    os.makedirs(SIMULATION_DIR, exist_ok=True)
+    os.makedirs(Config.SIMULATION_DIR, exist_ok=True)
 
-    BEST_CONFIG_PATH = f"{SIMULATION_DIR}/best_config.pkl"
+    BEST_CONFIG_PATH = f"{Config.SIMULATION_DIR}/best_config.pkl"
     
-    u_df = pd.read_csv(f"{MODEL_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
-    full_df = pd.read_csv(f"{DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
+    u_df = pd.read_csv(f"{Config.MODEL_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
+    full_df = pd.read_csv(f"{Config.DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
     dates_to_forecast = full_df.loc[OOS_START_DATE:].index
 
     def task_generator(dates, config):
@@ -423,14 +420,14 @@ def main():
 
     final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
 
-    tuned_results_path = f"{SIMULATION_DIR}/garch_copula_all_results.csv"
-    tuned_params_path = f"{SIMULATION_DIR}/copula_params_TUNED.pkl"
+    tuned_results_path = f"{Config.SIMULATION_DIR}/garch_copula_all_results.csv"
+    tuned_params_path = f"{Config.SIMULATION_DIR}/copula_params_TUNED.pkl"
     final_df.to_csv(tuned_results_path, float_format="%.6f")
 
     final_copulas = estimate_copulas(u_df, best_config)
     with open(tuned_params_path, "wb") as fh:
         pickle.dump(final_copulas, fh)
-    with open(f"{SIMULATION_DIR}/best_config.pkl", "wb") as f:
+    with open(f"{Config.SIMULATION_DIR}/best_config.pkl", "wb") as f:
         pickle.dump(best_config, f)
 
     print(f"\nSaved final tuned forecasts → {tuned_results_path}")

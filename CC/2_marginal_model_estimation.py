@@ -29,6 +29,19 @@ from config import Config
 DATA_FILE = os.path.join(Config.DATA_DIR, "spx_dax_daily_data.csv")
 os.makedirs(Config.MODEL_DIR, exist_ok=True)
 
+IN_SAMPLE_RATIO = 0.80  # 80% for training, 20% for testing
+# GARCH model specifications
+VOL_FAMILIES = {
+    "GARCH":  dict(vol="GARCH",  o=0),
+    "GJR":    dict(vol="GARCH",  o=1),
+    "EGARCH": dict(vol="EGARCH"),
+    "APARCH": dict(vol="APARCH")
+}
+DISTRIBUTIONS = ["t", "skewt", "ged"]
+PQ_GRID = [(1, 1)]
+MEAN_SPEC = {"Constant": dict(mean="Constant"), 
+                "AR":       dict(mean="AR", lags=1)}
+
 # --- 2. Helper Functions ---
 coef_sum = lambda params, pre: sum(v for k, v in params.items() if k.startswith(pre))
 
@@ -39,7 +52,7 @@ def fit_once(series, vol, dist, p, q, mean_kw):
     这样 GED 等更难收敛的分布也能参与比较。
     """
     mdl = arch_model(series, p=p, q=q, dist=dist,
-                     rescale=False, **mean_kw, **Config.VOL_FAMILIES[vol])
+                     rescale=False, **mean_kw, **VOL_FAMILIES[vol])
 
     for _ in range(3):                           # 尝试 3 次
         res = mdl.fit(disp="off", update_freq=0, show_warning=False)
@@ -89,8 +102,8 @@ def passes_basic(res, series) -> bool:
 
 def select_best(series, tag):
     candidates, shortlisted = [], []
-    for mean_tag, mean_kw in Config.MEAN_SPEC.items():
-        for vol, dist, (p, q) in product(Config.VOL_FAMILIES, Config.DISTRIBUTIONS, Config.PQ_GRID):
+    for mean_tag, mean_kw in MEAN_SPEC.items():
+        for vol, dist, (p, q) in product(VOL_FAMILIES, DISTRIBUTIONS, PQ_GRID):
             res = fit_once(series, vol, dist, p, q, mean_kw)
             if res is None: continue
             spec = (mean_tag, vol, dist, p, q)
@@ -366,7 +379,7 @@ def main():
         print("Please ensure the data file is in the same directory.")
         return
 
-    split = int(len(data) * Config.IN_SAMPLE_RATIO)
+    split = int(len(data) * IN_SAMPLE_RATIO)
     train_data = data.iloc[:split]  # Training set (80%)
     all_summaries = []
 

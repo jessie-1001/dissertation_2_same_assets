@@ -27,7 +27,11 @@ EXTREME_EVENTS_CSV      = os.path.join(Config.DATA_DIR, "extreme_return_events.c
 OVERVIEW_PNG            = os.path.join(Config.DATA_DIR, "price_return_overview.png")
 EXTREME_RETURNS_PNG     = os.path.join(Config.DATA_DIR, "extreme_returns.png")
 
-# Other script-specific settings (can be moved to config.py if preferred)
+# Other script-specific settings
+START_DATE = "2007-01-01"
+END_DATE = "2025-06-01"
+TICKERS = ["^GSPC", "^GDAXI"]
+
 THRESHOLD_MODE          = "dual"    # "fixed"  or "dual"
 FIXED_PCT               = 5         # 5  ->  ±5%
 K_SIGMA                 = 3         # used when THRESHOLD_MODE="dual"
@@ -40,12 +44,12 @@ os.makedirs(Config.DATA_DIR, exist_ok=True)
 # -----------------------------------------------------------------------------
 
 def download_prices() -> pd.DataFrame:
-    print(f"Downloading {Config.TICKERS} from {Config.START_DATE} to {Config.END_DATE} …")
+    print(f"Downloading {TICKERS} from {START_DATE} to {END_DATE} …")
     close = (
         yf.download(
-            Config.TICKERS,
-            start=Config.START_DATE,
-            end=Config.END_DATE,
+            TICKERS,
+            start=START_DATE,
+            end=END_DATE,
             progress=False,
             auto_adjust=True,
             threads=False,
@@ -105,7 +109,7 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
 def gap_summary(full_index: pd.DatetimeIndex) -> None:
     if not SHOW_GAP_SUMMARY:
         return
-    bdays = pd.bdate_range(Config.START_DATE, Config.END_DATE)
+    bdays = pd.bdate_range(START_DATE, END_DATE)
     missing = bdays.difference(full_index)
     gaps = missing.to_series().diff().dt.days.fillna(1).loc[lambda s: s > 1]
     if gaps.empty:

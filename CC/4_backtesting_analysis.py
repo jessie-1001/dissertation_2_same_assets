@@ -29,22 +29,20 @@ import warnings
 import matplotlib as mpl
 from datetime import datetime
 
+from config import Config
+
 # ============================================================================ #
 # 1. CONFIGURATION
 # ============================================================================ #
 
 # --- File Paths ---
-# Assumes a directory structure like: ./CC/simulation/, ./CC/data/, etc.
-SIMULATION_DIR = "CC/simulation"
-DATA_DIR       = "CC/data"
-MODEL_DIR      = "CC/model"
-ANALYSIS_DIR   = "CC/analysis"
-os.makedirs(ANALYSIS_DIR, exist_ok=True)
+
+os.makedirs(Config.ANALYSIS_DIR, exist_ok=True)
 
 # --- Input Files ---
-FORECAST_RESULTS_CSV = f"{SIMULATION_DIR}/garch_copula_all_results.csv"
-ACTUAL_RETURNS_CSV = f"{DATA_DIR}/spx_dax_daily_data.csv"
-PIT_DATA_CSV = f"{MODEL_DIR}/copula_input_data_full.csv"
+FORECAST_RESULTS_CSV = f"{Config.SIMULATION_DIR}/garch_copula_all_results.csv"
+ACTUAL_RETURNS_CSV = f"{Config.DATA_DIR}/spx_dax_daily_data.csv"
+PIT_DATA_CSV = f"{Config.MODEL_DIR}/copula_input_data_full.csv"
 
 # --- Parameters ---
 ALPHA = 0.01  # For 99% VaR / ES
@@ -222,7 +220,7 @@ def plot_dependence_structure(pit_df, period=None, tag="full_sample"):
             xlabel="PIT (SPX)", ylabel="PIT (DAX)", aspect="equal")
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(f"{ANALYSIS_DIR}/dependence_{tag}.png", dpi=150)
+    plt.savefig(f"{Config.ANALYSIS_DIR}/dependence_{tag}.png", dpi=150)
     plt.close()
 
 
@@ -255,7 +253,7 @@ if __name__ == "__main__":
     summary_df = backtest_all_models(forecasts_df, actuals_df, alpha=ALPHA)
     print(summary_df.to_markdown(index=False))
     
-    summary_filename = f"{ANALYSIS_DIR}/backtesting_summary_{datetime.now():%Y%m%d_%H%M}.csv"
+    summary_filename = f"{Config.ANALYSIS_DIR}/backtesting_summary_{datetime.now():%Y%m%d_%H%M}.csv"
     summary_df.to_csv(summary_filename, index=False)
     print(f"\nSaved backtesting summary to: {summary_filename}")
 
@@ -290,7 +288,7 @@ if __name__ == "__main__":
         plt.ylabel("Return (%)")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(f"{ANALYSIS_DIR}/var_breaches_plot.png", dpi=150)
+        plt.savefig(f"{Config.ANALYSIS_DIR}/var_breaches_plot.png", dpi=150)
         plt.close()
 
     # Weight Distribution Plots
@@ -304,10 +302,10 @@ if __name__ == "__main__":
             plt.axvline(0.5, c='r', ls='--', lw=1)
             plt.xlim(0, 1)
     plt.tight_layout()
-    plt.savefig(f"{ANALYSIS_DIR}/weight_distributions.png", dpi=150)
+    plt.savefig(f"{Config.ANALYSIS_DIR}/weight_distributions.png", dpi=150)
     plt.close()
 
-    print("\nDiagnostic plots saved to:", ANALYSIS_DIR)
+    print("\nDiagnostic plots saved to:", Config.ANALYSIS_DIR)
     print("=" * 80)
     print(">>> SCRIPT 04 FINISHED <<<")
     print("=" * 80)
