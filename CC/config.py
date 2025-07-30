@@ -27,7 +27,8 @@ class Config:
     }
     DISTRIBUTIONS = ["t", "skewt", "ged"]
     PQ_GRID = [(1, 1)]
-    MEAN_SPEC = {"Constant": dict(mean="Constant"), "AR": dict(mean="AR", lags=1)}
+    MEAN_SPEC = {"Constant": dict(mean="Constant"), 
+                 "AR":       dict(mean="AR", lags=1)}
 
     # --- 3. Copula Simulation Configuration (for 3_copula_simulation.py) ---
     # WORKFLOW CONTROL: Set to True for the initial run to find best parameters.
