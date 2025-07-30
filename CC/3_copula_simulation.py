@@ -24,18 +24,12 @@ from scipy.linalg import cholesky
 from scipy.optimize import minimize
 from scipy.stats import gennorm, kendalltau, norm, t, chi2
 from tqdm import tqdm
+import optuna
+
 
 # ============================================================================ #
 # 1. CONFIGURATION AND HYPERPARAMETER GRID
 # ============================================================================ #
-
-# --- Hyperparameter Grid for Tuning ---
-# NOTE: A larger grid will be more thorough but take much longer to run.
-PARAM_GRID = {
-    "refit_freq": [30, 63],         # [30, 63, 126] - How often to re-estimate GARCH models (in days)
-    "beta_cap":   [0.85, 0.90, 0.95], # [0.85, 0.90, 0.95] - Cap on GARCH persistence parameter
-    "tail_adj":   [1.0, 1.3, 1.5],   # [1.0, 1.3, 1.5] - Multiplier for copula tail dependence
-}
 
 # --- GARCH Model Specifications ---
 VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
@@ -345,83 +339,81 @@ def main():
     u_df = pd.read_csv(f"{INPUT_DATA_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
     full_df = pd.read_csv(f"{FULL_DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
     dates_to_forecast = full_df.loc[OOS_START_DATE:].index
-    
-    tuning_results = []
-    param_combinations = [dict(zip(PARAM_GRID.keys(), v)) for v in product(*PARAM_GRID.values())]
-    
-    print(f"\n--- Starting Hyperparameter Tuning for {len(param_combinations)} combinations ---")
-    
-    # --- Generator to create tasks for the parallel pool ---
+
     def task_generator(dates, config):
         for date in dates:
-            # Yield only the minimal, stable data needed by the worker
             yield delayed(one_day_forecast)(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES)
 
-    # --- Main Tuning Loop ---
-    for i, params in enumerate(param_combinations):
+    # --- Use Optuna for Bayesian Optimization ---
+    def objective(trial):
         config = {
-            "refit_freq": params['refit_freq'], # Note: refit_freq is no longer used but kept for consistency
-            "beta_cap": params['beta_cap'],
-            "tail_adj": params['tail_adj'],
+            "refit_freq": trial.suggest_categorical("refit_freq", [30, 63, 126]),
+            "beta_cap": trial.suggest_float("beta_cap", 0.70, 0.95, step=0.05),
+            "tail_adj": trial.suggest_float("tail_adj", 1.0, 1.5, step=0.1),
             "sims": SIMS_PER_DAY,
             "alpha": PORTFOLIO_ALPHA,
         }
-        print(f"\n[{i+1}/{len(param_combinations)}] Testing params: {config}")
 
+        print(f"\n[Trial {trial.number}] Testing params: {config}")
+        
         tasks = task_generator(dates_to_forecast, config)
         forecasts = Parallel(n_jobs=N_JOBS)(
-            tqdm(tasks, desc="Rolling Forecast", total=len(dates_to_forecast))
+            tqdm(tasks, desc=f"Forecast Trial {trial.number}", total=len(dates_to_forecast))
         )
-        
+
         forecast_df = pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
         backtest_results = run_backtest(forecast_df, full_df, config['alpha'])
-        
+
+        best_metric = float("inf")
         for model_name, metrics in backtest_results.items():
-            tuning_results.append({ "params": str(config), "model": model_name, **metrics })
-            
-    # --- Analyze Tuning Results and Find Best Parameters ---
-    results_df = pd.DataFrame(tuning_results)
-    print("\n\n--- Hyperparameter Tuning Results Summary ---")
-    print(results_df.to_markdown(index=False, floatfmt=".4f"))
-    
-    valid_models = results_df[(results_df['kupiec_p'] > 0.05) & (results_df['christoffersen_p'] > 0.05)].copy()
-    
-    if valid_models.empty:
-        print("\n\n[CRITICAL] No parameter combination produced a valid model. Exiting.")
-        return
-        
-    valid_models['abs_breach_error'] = abs(valid_models['breaches'] - valid_models['expected_breaches'])
-    best_model_run = valid_models.loc[valid_models['abs_breach_error'].idxmin()]
-    
-    print("\n\n--- Best Performing Model Configuration ---")
-    print(best_model_run)
-    
-    # --- Perform Final Run with Best Parameters ---
-    best_params_str = best_model_run['params']
-    best_config = eval(best_params_str)
-    print(f"\n--- Performing final run with optimal parameters: {best_config} ---")
-    
+            if metrics['kupiec_p'] > 0.05 and metrics['christoffersen_p'] > 0.05:
+                error = abs(metrics['breaches'] - metrics['expected_breaches'])
+                best_metric = min(best_metric, error)
+
+        # If no model passed the backtest, penalize
+        if best_metric == float("inf"):
+            return 1e6
+
+        return best_metric
+
+    # --- Run the study ---
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=20)  # You can increase this
+
+    # --- Best parameters ---
+    best_config = {
+        "refit_freq": study.best_params["refit_freq"],
+        "beta_cap": study.best_params["beta_cap"],
+        "tail_adj": study.best_params["tail_adj"],
+        "sims": SIMS_PER_DAY,
+        "alpha": PORTFOLIO_ALPHA,
+    }
+    print("\n\n--- Best Params Found by Optuna ---")
+    print(best_config)
+
+    # --- Final full forecast using best parameters ---
     final_tasks_gen = task_generator(dates_to_forecast, best_config)
     final_forecasts = Parallel(n_jobs=N_JOBS)(
         tqdm(final_tasks_gen, desc="Final Forecast", total=len(dates_to_forecast))
     )
-        
+
     final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
-    
+
     tuned_results_path = f"{RESULTS_DIR}/garch_copula_all_results.csv"
     tuned_params_path = f"{RESULTS_DIR}/copula_params_TUNED.pkl"
     final_df.to_csv(tuned_results_path, float_format="%.6f")
 
     final_copulas = estimate_copulas(u_df, best_config)
-    with open(tuned_params_path, "wb") as fh: pickle.dump(final_copulas, fh)
+    with open(tuned_params_path, "wb") as fh:
+        pickle.dump(final_copulas, fh)
     with open("CC/simulation/best_config.pkl", "wb") as f:
         pickle.dump(best_config, f)
 
-    
     print(f"\nSaved final tuned forecasts → {tuned_results_path}")
     print(f"Saved final tuned copula params → {tuned_params_path}")
     print("="*80)
     print(">>> Process finished successfully. <<<")
+
 
 if __name__ == "__main__":
     main()
