@@ -1,0 +1,5 @@
+Model,Observations,Breaches,Expected,Breach Rate,Kupiec p-val,Christoffersen p-val,ES Test Verdict,Annualized Return %,Annualized Vol %,Sharpe Ratio,Performance vs 50/50
+Gaussian,1340,17,13.4,0.0127,0.3427,0.0762,Pass,8.17,18.86,0.433,Worse
+StudentT,1340,16,13.4,0.0119,0.4885,0.0631,Pass,8.22,18.87,0.436,Worse
+Clayton,1340,14,13.4,0.0104,0.8701,0.0415,Pass,8.06,18.86,0.427,Worse
+Gumbel,1340,25,13.4,0.0187,0.0045,0.2437,Pass,8.25,18.88,0.437,Worse

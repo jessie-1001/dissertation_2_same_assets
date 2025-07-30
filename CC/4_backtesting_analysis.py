@@ -111,7 +111,7 @@ def christoffersen(hits: pd.Series):
     logL0 = (n00 + n10) * np.log(1 - pi) + (n01 + n11) * np.log(pi)
     logL1 = n00 * np.log(1 - pi0) + n01 * np.log(pi0) + n10 * np.log(1 - pi1) + n11 * np.log(pi1)
     
-    stat = 2 * (ll1 - ll0)
+    stat = 2 * (logL1 - logL0)
     pval = 1 - stats.chi2.cdf(stat, 1)
     return stat, pval
 
