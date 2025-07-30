@@ -18,37 +18,34 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import jarque_bera
 
+from config import Config
+
 # ------------------------------ CONFIG SECTION ------------------------------ #
-START_DATE      = "2007-01-01"
-END_DATE        = "2025-06-01"
-TICKERS         = ["^GSPC", "^GDAXI"]
+# Define output file paths using the central config
+OUTPUT_CSV              = os.path.join(Config.DATA_DIR, "spx_dax_daily_data.csv")
+EXTREME_EVENTS_CSV      = os.path.join(Config.DATA_DIR, "extreme_return_events.csv")
+OVERVIEW_PNG            = os.path.join(Config.DATA_DIR, "price_return_overview.png")
+EXTREME_RETURNS_PNG     = os.path.join(Config.DATA_DIR, "extreme_returns.png")
 
-DATA_DIR             = "CC/data"
-OUTPUT_CSV              = f"{DATA_DIR}/spx_dax_daily_data.csv"
-EXTREME_EVENTS_CSV      = f"{DATA_DIR}/extreme_return_events.csv"
-
-OVERVIEW_PNG            = f"{DATA_DIR}/price_return_overview.png"
-EXTREME_RETURNS_PNG     = f"{DATA_DIR}/extreme_returns.png"
-
+# Other script-specific settings (can be moved to config.py if preferred)
 THRESHOLD_MODE          = "dual"    # "fixed"  or "dual"
 FIXED_PCT               = 5         # 5  ->  ±5%
 K_SIGMA                 = 3         # used when THRESHOLD_MODE="dual"
-
 SHOW_GAP_SUMMARY        = True      # list multi-day data gaps?
 DRAW_THRESHOLD_LINES    = True      # draw ±threshold on plots?
 # ---------------------------------------------------------------------------- #
 
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(Config.DATA_DIR, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 
 def download_prices() -> pd.DataFrame:
-    print(f"Downloading {TICKERS} from {START_DATE} to {END_DATE} …")
+    print(f"Downloading {Config.TICKERS} from {Config.START_DATE} to {Config.END_DATE} …")
     close = (
         yf.download(
-            TICKERS,
-            start=START_DATE,
-            end=END_DATE,
+            Config.TICKERS,
+            start=Config.START_DATE,
+            end=Config.END_DATE,
             progress=False,
             auto_adjust=True,
             threads=False,
@@ -108,7 +105,7 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
 def gap_summary(full_index: pd.DatetimeIndex) -> None:
     if not SHOW_GAP_SUMMARY:
         return
-    bdays = pd.bdate_range(START_DATE, END_DATE)
+    bdays = pd.bdate_range(Config.START_DATE, Config.END_DATE)
     missing = bdays.difference(full_index)
     gaps = missing.to_series().diff().dt.days.fillna(1).loc[lambda s: s > 1]
     if gaps.empty:
