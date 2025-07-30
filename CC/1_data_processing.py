@@ -23,12 +23,12 @@ START_DATE      = "2007-01-01"
 END_DATE        = "2025-06-01"
 TICKERS         = ["^GSPC", "^GDAXI"]
 
-RESULTS_DIR             = "CC/data"
-OUTPUT_CSV              = f"{RESULTS_DIR}/spx_dax_daily_data.csv"
-EXTREME_EVENTS_CSV      = f"{RESULTS_DIR}/extreme_return_events.csv"
+DATA_DIR             = "CC/data"
+OUTPUT_CSV              = f"{DATA_DIR}/spx_dax_daily_data.csv"
+EXTREME_EVENTS_CSV      = f"{DATA_DIR}/extreme_return_events.csv"
 
-OVERVIEW_PNG            = f"{RESULTS_DIR}/price_return_overview.png"
-EXTREME_RETURNS_PNG     = f"{RESULTS_DIR}/extreme_returns.png"
+OVERVIEW_PNG            = f"{DATA_DIR}/price_return_overview.png"
+EXTREME_RETURNS_PNG     = f"{DATA_DIR}/extreme_returns.png"
 
 THRESHOLD_MODE          = "dual"    # "fixed"  or "dual"
 FIXED_PCT               = 5         # 5  ->  ±5%
@@ -38,7 +38,7 @@ SHOW_GAP_SUMMARY        = True      # list multi-day data gaps?
 DRAW_THRESHOLD_LINES    = True      # draw ±threshold on plots?
 # ---------------------------------------------------------------------------- #
 
-os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 

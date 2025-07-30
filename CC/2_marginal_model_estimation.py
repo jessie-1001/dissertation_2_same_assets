@@ -25,10 +25,10 @@ import seaborn as sns
 
 # --- 1. Configuration ---
 DATA_DIR        = "CC/data"
-RESULTS_DIR     = "CC/model"
+MODEL_DIR     = "CC/model"
 DATA_FILE       = f"{DATA_DIR}/spx_dax_daily_data.csv"
 IN_SAMPLE_RATIO = 0.80  # 80% for training, 20% for testing
-os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 VOL_FAMILIES = {
     "GARCH":  dict(vol="GARCH",  o=0),
@@ -266,7 +266,7 @@ def plot_volatility(res, series, tag, short_name):
     ax.set_title(f'Conditional Volatility vs Returns for {tag}', fontsize=16)
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.5)
-    f_path = os.path.join(RESULTS_DIR, f"{short_name}_{tag.replace(' ', '_')}_volatility.png")
+    f_path = os.path.join(MODEL_DIR, f"{short_name}_{tag.replace(' ', '_')}_volatility.png")
     plt.tight_layout()
     plt.savefig(f_path)
     plt.close()
@@ -324,7 +324,7 @@ def plot_diagnostics(res, series, tag, short_name):
     ax[1, 1].set_ylabel('Density')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    f_path = os.path.join(RESULTS_DIR, f"{short_name}_{tag.replace(' ', '_')}_diagnostics.png")
+    f_path = os.path.join(MODEL_DIR, f"{short_name}_{tag.replace(' ', '_')}_diagnostics.png")
     plt.savefig(f_path)
     plt.close()
     print(f"  > Diagnostics plot saved to {f_path}")
@@ -353,7 +353,7 @@ def run_stage(frame, label, full_data=None, split_idx=None):
             else:
                 print(f"⚠ OOS MSE calculation failed for {short}")
 
-        out_path = os.path.join(RESULTS_DIR, f"{short}_{label}.txt")
+        out_path = os.path.join(MODEL_DIR, f"{short}_{label}.txt")
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(f"{spec_str} | BIC={bic:,.2f}\n\n{res.summary()}")
         
@@ -390,7 +390,7 @@ def main():
     all_summaries.extend(summary_train)
     
     # Generate PIT for copula modeling (training set only)
-    copula_input_data_path = f"{RESULTS_DIR}/copula_input_data.csv"
+    copula_input_data_path = f"{MODEL_DIR}/copula_input_data.csv"
     pd.concat([
         pit_series(res_train["SPX"], train_data["SPX_Return"]),
         pit_series(res_train["DAX"], train_data["DAX_Return"])
@@ -405,7 +405,7 @@ def main():
     all_summaries.extend(summary_full)
 
     # Generate PIT for copula modeling (full sample)
-    copula_full_data_path = f"{RESULTS_DIR}/copula_input_data_full.csv"
+    copula_full_data_path = f"{MODEL_DIR}/copula_input_data_full.csv"
     pd.concat([
         pit_series(res_full["SPX"], data["SPX_Return"]),
         pit_series(res_full["DAX"], data["DAX_Return"])

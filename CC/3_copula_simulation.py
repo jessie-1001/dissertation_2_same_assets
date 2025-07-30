@@ -30,6 +30,7 @@ import optuna
 # ============================================================================ #
 # 1. CONFIGURATION AND HYPERPARAMETER GRID
 # ============================================================================ #
+RUN_OPTUNA_TUNING = False # <<< *** MODIFY THIS SWITCH AS NEEDED ***
 
 # --- GARCH Model Specifications ---
 VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
@@ -254,7 +255,12 @@ def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
             VaR = np.percentile(port, 100 * config['alpha'])
             ES = port[port <= VaR].mean()
 
-        out.update({f"{name}_VaR": VaR, f"{name}_ES": ES})
+        out.update({
+            f"{name}_wSPX": w_s, 
+            f"{name}_wDAX": w_d, 
+            f"{name}_VaR": VaR, 
+            f"{name}_ES": ES
+        })
     out["Date"] = date
     return out
 
@@ -331,67 +337,85 @@ def main():
     print(">>> SCRIPT 3 (FINAL): AUTOMATED GARCH-COPULA TUNING & FORECASTING <<<")
     
     # --- Path setup ---
-    FULL_DATA_DIR   = "CC/data"
-    INPUT_DATA_DIR  = "CC/model"
-    RESULTS_DIR     = "CC/simulation"
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    DATA_DIR   = "CC/data"
+    MODEL_DIR  = "CC/model"
+    SIMULATION_DIR     = "CC/simulation"
+    os.makedirs(SIMULATION_DIR, exist_ok=True)
+
+    BEST_CONFIG_PATH = f"{SIMULATION_DIR}/best_config.pkl"
     
-    u_df = pd.read_csv(f"{INPUT_DATA_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
-    full_df = pd.read_csv(f"{FULL_DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
+    u_df = pd.read_csv(f"{MODEL_DIR}/copula_input_data.csv", index_col=0, parse_dates=True)
+    full_df = pd.read_csv(f"{DATA_DIR}/spx_dax_daily_data.csv", index_col=0, parse_dates=True)
     dates_to_forecast = full_df.loc[OOS_START_DATE:].index
 
     def task_generator(dates, config):
         for date in dates:
             yield delayed(one_day_forecast)(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES)
+    
+    best_config = {}
 
     # --- Use Optuna for Bayesian Optimization ---
-    def objective(trial):
-        config = {
-            "refit_freq": trial.suggest_categorical("refit_freq", [30, 63, 126]),
-            "beta_cap": trial.suggest_float("beta_cap", 0.70, 0.95, step=0.05),
-            "tail_adj": trial.suggest_float("tail_adj", 1.0, 1.5, step=0.1),
+    if RUN_OPTUNA_TUNING:
+        print("\n--- Running Optuna Hyperparameter Tuning ---")
+        def objective(trial):
+            config = {
+                "refit_freq": trial.suggest_categorical("refit_freq", [63]),
+                "beta_cap": trial.suggest_float("beta_cap", 0.93, 0.99, step=0.02),
+                "tail_adj": trial.suggest_float("tail_adj", 1.4, 2.0, step=0.1),
+                "sims": SIMS_PER_DAY,
+                "alpha": PORTFOLIO_ALPHA,
+            }
+
+            print(f"\n[Trial {trial.number}] Testing params: {config}")
+            
+            tasks = task_generator(dates_to_forecast, config)
+            forecasts = Parallel(n_jobs=N_JOBS)(
+                tqdm(tasks, desc=f"Forecast Trial {trial.number}", total=len(dates_to_forecast))
+            )
+
+            forecast_df = pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
+            backtest_results = run_backtest(forecast_df, full_df, config['alpha'])
+
+            best_metric = float("inf")
+            for model_name, metrics in backtest_results.items():
+                if metrics['kupiec_p'] > 0.05 and metrics['christoffersen_p'] > 0.05:
+                    error = abs(metrics['breaches'] - metrics['expected_breaches'])
+                    best_metric = min(best_metric, error)
+
+            # If no model passed the backtest, penalize
+            if best_metric == float("inf"):
+                return 1e6
+
+            return best_metric
+
+        # --- Run the study ---
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=20)  # You can increase this
+
+        # --- Best parameters ---
+        best_config = {
+            "refit_freq": study.best_params["refit_freq"],
+            "beta_cap": study.best_params["beta_cap"],
+            "tail_adj": study.best_params["tail_adj"],
             "sims": SIMS_PER_DAY,
             "alpha": PORTFOLIO_ALPHA,
         }
+        print("\n\n--- Best Params Found by Optuna ---")
+        print(best_config)
 
-        print(f"\n[Trial {trial.number}] Testing params: {config}")
-        
-        tasks = task_generator(dates_to_forecast, config)
-        forecasts = Parallel(n_jobs=N_JOBS)(
-            tqdm(tasks, desc=f"Forecast Trial {trial.number}", total=len(dates_to_forecast))
-        )
-
-        forecast_df = pd.DataFrame([f for f in forecasts if f]).set_index("Date").sort_index()
-        backtest_results = run_backtest(forecast_df, full_df, config['alpha'])
-
-        best_metric = float("inf")
-        for model_name, metrics in backtest_results.items():
-            if metrics['kupiec_p'] > 0.05 and metrics['christoffersen_p'] > 0.05:
-                error = abs(metrics['breaches'] - metrics['expected_breaches'])
-                best_metric = min(best_metric, error)
-
-        # If no model passed the backtest, penalize
-        if best_metric == float("inf"):
-            return 1e6
-
-        return best_metric
-
-    # --- Run the study ---
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=20)  # You can increase this
-
-    # --- Best parameters ---
-    best_config = {
-        "refit_freq": study.best_params["refit_freq"],
-        "beta_cap": study.best_params["beta_cap"],
-        "tail_adj": study.best_params["tail_adj"],
-        "sims": SIMS_PER_DAY,
-        "alpha": PORTFOLIO_ALPHA,
-    }
-    print("\n\n--- Best Params Found by Optuna ---")
-    print(best_config)
-
+    else:
+        print(f"\n--- Skipping Optuna. Loading best config from {BEST_CONFIG_PATH} ---")
+        try:
+            with open(BEST_CONFIG_PATH, "rb") as f:
+                best_config = pickle.load(f)
+            print(f"Successfully loaded configuration: {best_config}")
+        except FileNotFoundError:
+            print(f"[Error] {BEST_CONFIG_PATH} not found.")
+            print("Please run the script with RUN_OPTUNA_TUNING = True at least once.")
+            return
+    
     # --- Final full forecast using best parameters ---
+    print("\n--- Generating Final Forecast with Best Configuration ---")
     final_tasks_gen = task_generator(dates_to_forecast, best_config)
     final_forecasts = Parallel(n_jobs=N_JOBS)(
         tqdm(final_tasks_gen, desc="Final Forecast", total=len(dates_to_forecast))
@@ -399,14 +423,14 @@ def main():
 
     final_df = pd.DataFrame([f for f in final_forecasts if f]).set_index("Date").sort_index()
 
-    tuned_results_path = f"{RESULTS_DIR}/garch_copula_all_results.csv"
-    tuned_params_path = f"{RESULTS_DIR}/copula_params_TUNED.pkl"
+    tuned_results_path = f"{SIMULATION_DIR}/garch_copula_all_results.csv"
+    tuned_params_path = f"{SIMULATION_DIR}/copula_params_TUNED.pkl"
     final_df.to_csv(tuned_results_path, float_format="%.6f")
 
     final_copulas = estimate_copulas(u_df, best_config)
     with open(tuned_params_path, "wb") as fh:
         pickle.dump(final_copulas, fh)
-    with open("CC/simulation/best_config.pkl", "wb") as f:
+    with open(f"{SIMULATION_DIR}/best_config.pkl", "wb") as f:
         pickle.dump(best_config, f)
 
     print(f"\nSaved final tuned forecasts → {tuned_results_path}")
