@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from arch import arch_model
-from joblib import Parallel, delayed, Memory
+from joblib import Parallel, delayed
 from scipy.linalg import cholesky
 from scipy.optimize import minimize
 from scipy.stats import gennorm, kendalltau, norm, t, chi2
@@ -46,7 +46,6 @@ WEIGHT_FLOOR = 0.25        # Minimum portfolio weight for an asset
 WEIGHT_CAP = 0.75          # Maximum portfolio weight for an asset
 N_JOBS = -1                # Use all available CPU cores for parallel processing
 
-memory = Memory(location=f"{Config.BASE_DIR}/.garch_cache", verbose=0)
 # ============================================================================ #
 # 2. HELPER & UTILITY FUNCTIONS
 # ============================================================================ #
@@ -129,7 +128,7 @@ def estimate_copulas(u_raw: pd.DataFrame, config: dict):
 # ============================================================================ #
 # 3. CORE SIMULATION LOGIC
 # ============================================================================ #
-@memory.cache
+
 def fit_best_garch(series: pd.Series, tag: str, config: dict):
     """Selects the best GARCH model for a series based on BIC."""
     candidates = []
@@ -178,31 +177,16 @@ def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
     This function is designed to be run in a separate process and now includes
     caching to avoid re-fitting GARCH models unnecessarily.
     """
-
     # --- 1. Data Preparation ---
     idx = full_df.index.get_loc(date)
     # Use pre-calculated PITs for copula fitting
     u_hist = u_df.loc[u_df.index < date] 
 
-    tag_spx = f"SPX_{idx // config['refit_freq']}"
-    tag_dax = f"DAX_{idx // config['refit_freq']}"
-    if idx % config['refit_freq'] == 0:
-        hist_df = full_df.iloc[:idx + 1]
-        try:
-            res_s = fit_best_garch(hist_df["SPX_Return"], tag_spx, config)[0]
-            res_d = fit_best_garch(hist_df["DAX_Return"], tag_dax, config)[0]
-        except Exception as e:
-            print(f"[Warning] GARCH refit failed at {date}: {e}")
-    else:
-        try:
-            res_s = fit_best_garch(full_df.iloc[:idx]["SPX_Return"], tag_spx, config)[0]
-        except (FileNotFoundError, KeyError):
-            print(f"[CACHE MISS] SPX unexpectedly refit at {date} (idx {idx})")
-
-        try:
-            res_d = fit_best_garch(full_df.iloc[:idx]["DAX_Return"], tag_dax, config)[0]
-        except (FileNotFoundError, KeyError):
-            print(f"[CACHE MISS] DAX unexpectedly refit at {date} (idx {idx})")
+    hist_df_for_garch = full_df.iloc[:idx + 1]
+    
+    # Fit, update cache, and update the last index key
+    res_s, _, _, _ = fit_best_garch(hist_df_for_garch["SPX_Return"], "SPX", config)
+    res_d, _, _, _ = fit_best_garch(hist_df_for_garch["DAX_Return"], "DAX", config)
     
     # --- 2. Estimate Copulas ---
     # This is still done daily as the historical PIT window grows each day.
@@ -347,9 +331,9 @@ def main():
         print("\n--- Running Optuna Hyperparameter Tuning ---")
         def objective(trial):
             config = {
-                "refit_freq": trial.suggest_categorical("refit_freq", [63]),
+                "refit_freq": trial.suggest_categorical("refit_freq", [1, 30, 63]),
                 "beta_cap": trial.suggest_float("beta_cap", 0.93, 0.99, step=0.02),
-                "tail_adj": trial.suggest_float("tail_adj", 1.4, 2.0, step=0.1),
+                "tail_adj": trial.suggest_float("tail_adj", 1.4, 2.0, step=0.2),
                 "sims": SIMS_PER_DAY,
                 "alpha": PORTFOLIO_ALPHA,
             }
