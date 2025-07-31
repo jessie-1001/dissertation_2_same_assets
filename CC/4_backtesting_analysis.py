@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 # =============================================================================
-# SCRIPT 04: BACKTESTING & PERFORMANCE ANALYSIS (Modified)
+# SCRIPT 04: BACKTESTING & PERFORMANCE ANALYSIS (Modified for Sub-Periods)
 # =============================================================================
 """
 This script serves as the final analysis layer for the GARCH-Copula pipeline.
 
 It performs the following steps:
 1.  Loads the simulation forecasts, actual market returns, and PIT data.
-2.  Conducts rigorous backtesting for each copula model's VaR forecasts, including:
-    - Kupiec's Proportion of Failures (POF) test.
-    - Christoffersen's independence test.
-    - An Expected Shortfall (ES) backtest to check for loss severity.
-3.  Calculates portfolio performance metrics (e.g., Sharpe ratio) using the
-    model's dynamic weights and compares them to a 50/50 benchmark.
-4.  Generates and saves a summary report and diagnostic plots, including:
-    - Dependence structure plots from PIT data.
-    - A timeline of VaR breaches.
-    - Distributions of the model-recommended portfolio weights.
+2.  Defines distinct market regimes (Crisis vs. Non-Crisis).
+3.  Conducts rigorous backtesting for each copula model's VaR and ES forecasts
+    ACROSS EACH REGIME, including Kupiec, Christoffersen, and ES tests.
+4.  Calculates portfolio performance metrics for each regime.
+5.  Generates a single, comprehensive summary report and diagnostic plots.
 """
 
 import os
@@ -36,7 +31,6 @@ from config import Config
 # ============================================================================ #
 
 # --- File Paths ---
-
 os.makedirs(Config.ANALYSIS_DIR, exist_ok=True)
 
 # --- Input Files ---
@@ -57,9 +51,8 @@ mpl.rcParams.update({
     "figure.dpi": 120
 })
 
-
 # ============================================================================ #
-# 2. STATISTICAL TEST FUNCTIONS
+# 2. STATISTICAL TEST FUNCTIONS (No changes needed here)
 # ============================================================================ #
 
 def kupiec_pof(hits: pd.Series, alpha=ALPHA):
@@ -74,14 +67,14 @@ def kupiec_pof(hits: pd.Series, alpha=ALPHA):
         return n1, np.nan, np.nan, np.nan
 
     p = alpha
-    pi_hat = n1 / n
+    pi_hat = n1 / n if n > 0 else 0
 
     # Log-likelihood calculation with edge case handling (0 or 100% breaches)
     if n1 in (0, n):
         log_likelihood_ratio = -2 * n * np.log((1 - p) if n1 == 0 else p)
     else:
         log_likelihood_ratio = 2 * (n1 * np.log(pi_hat / p) +
-                                    (n - n1) * np.log((1 - pi_hat) / (1 - p)))
+                                      (n - n1) * np.log((1 - pi_hat) / (1 - p)))
 
     p_value = 1 - stats.chi2.cdf(log_likelihood_ratio, 1)
     return n1, log_likelihood_ratio, p_value, pi_hat
@@ -93,7 +86,7 @@ def christoffersen(hits: pd.Series):
     Checks if VaR breaches are independent of each other (i.e., not clustered).
     Uses a small sample smoothing adjustment (+0.5) to prevent division by zero.
     """
-    if len(hits) < 15:
+    if len(hits) < 15 or hits.sum() < 2: # Test requires some breaches to be meaningful
         return np.nan, np.nan
 
     trans = pd.DataFrame({"prev": hits.shift(1), "curr": hits}).dropna()
@@ -103,11 +96,18 @@ def christoffersen(hits: pd.Series):
     n11 = len(trans[(trans.prev == 1) & (trans.curr == 1)]) + 0.5
 
     pi = (n01 + n11) / (n00 + n01 + n10 + n11)
+    if pi == 0 or pi ==1: return np.nan, np.nan
+    
     pi0 = n01 / (n00 + n01)
     pi1 = n11 / (n10 + n11)
 
     logL0 = (n00 + n10) * np.log(1 - pi) + (n01 + n11) * np.log(pi)
-    logL1 = n00 * np.log(1 - pi0) + n01 * np.log(pi0) + n10 * np.log(1 - pi1) + n11 * np.log(pi1)
+    
+    # Handle cases where pi0 or pi1 could be 0 or 1
+    if pi0 == 0 or pi0 == 1 or pi1 == 0 or pi1 == 1:
+        logL1 = logL0
+    else:
+        logL1 = n00 * np.log(1 - pi0) + n01 * np.log(pi0) + n10 * np.log(1 - pi1) + n11 * np.log(pi1)
     
     stat = 2 * (logL1 - logL0)
     pval = 1 - stats.chi2.cdf(stat, 1)
@@ -137,12 +137,13 @@ def es_backtest(realized_returns, es_forecast, var_forecast):
 
 
 # ============================================================================ #
-# 3. MAIN BACKTESTING AND VISUALIZATION FUNCTIONS
+# 3. MAIN BACKTESTING AND VISUALIZATION FUNCTIONS (No changes needed here)
 # ============================================================================ #
 
 def backtest_all_models(forecasts_df: pd.DataFrame, actuals_df: pd.DataFrame, alpha=ALPHA):
     """
-    Orchestrates the backtesting process for all specified copula models.
+    Orchestrates the backtesting process for all specified copula models
+    on a GIVEN DATAFRAME (can be a slice of the full data).
     """
     # Align actual returns with forecasts (T day's forecast for T+1's return)
     actuals_shifted = actuals_df.shift(-1)
@@ -158,8 +159,8 @@ def backtest_all_models(forecasts_df: pd.DataFrame, actuals_df: pd.DataFrame, al
 
         # Combine forecasts and actuals, dropping any non-overlapping periods
         data = pd.concat([forecasts_df[weight_cols + [var_col, es_col]], actuals_shifted[["SPX_Return", "DAX_Return"]]], axis=1).dropna()
-        if data.empty:
-            print(f"[Warning] Skipping {model}: No overlapping data for backtest.")
+        if data.empty or len(data) < 15:
+            # print(f"[Info] Skipping {model}: Not enough data for backtest in this period.")
             continue
 
         # --- KEY STEP: Calculate portfolio return using model's dynamic weights ---
@@ -248,24 +249,70 @@ if __name__ == "__main__":
         if df.index.tz:
             df.index = df.index.tz_localize(None)
 
-    # --- 4.2 Run Backtests and Display Summary ---
-    print("\n--- 2. Running Backtests (VaR 99%) ---")
-    summary_df = backtest_all_models(forecasts_df, actuals_df, alpha=ALPHA)
-    print(summary_df.to_markdown(index=False))
+    # <<< NEW: DEFINE MARKET REGIMES HERE >>>
+    # --------------------------------------------------------------------------
+    print("\n--- 2. Defining Market Regimes ---")
+    
+    # Define crisis periods
+    crisis_periods = {
+        "CovidCrash": ("2020-02-19", "2020-04-10"),
+        "BankingCrisis23": ("2023-03-08", "2023-03-31")
+    }
+    
+    # Create a boolean mask for all crisis days
+    crisis_mask = pd.Series(False, index=forecasts_df.index)
+    for name, (start, end) in crisis_periods.items():
+        crisis_mask.loc[start:end] = True
+        print(f"Regime '{name}' defined: {start} to {end}")
+
+    # Define all regimes for analysis
+    all_regimes = {
+        "Full Sample": forecasts_df.index,
+        **{name: forecasts_df.loc[start:end].index for name, (start, end) in crisis_periods.items()},
+        "Non-Crisis": forecasts_df.index[~crisis_mask]
+    }
+    print(f"Regime 'Non-Crisis' defined: All days excluding crisis periods.")
+    # --------------------------------------------------------------------------
+    # <<< END NEW >>>
+
+    # <<< NEW: LOOP THROUGH REGIMES FOR BACKTESTING >>>
+    # --------------------------------------------------------------------------
+    print("\n--- 3. Running Backtests for Each Regime ---")
+    
+    all_results = []
+    
+    for regime_name, regime_index in all_regimes.items():
+        print(f"\n... Backtesting for: {regime_name} ({len(regime_index)} obs) ...")
+        
+        # Slice the data for the current regime
+        forecasts_slice = forecasts_df.loc[regime_index]
+        actuals_slice = actuals_df.loc[regime_index]
+        
+        # Run the backtest on the sliced data
+        regime_summary_df = backtest_all_models(forecasts_slice, actuals_slice, alpha=ALPHA)
+        
+        # Add the regime name to the results
+        if not regime_summary_df.empty:
+            regime_summary_df.insert(0, "Market Regime", regime_name)
+            all_results.append(regime_summary_df)
+
+    # Combine all results into a single comprehensive table
+    final_summary_df = pd.concat(all_results, ignore_index=True)
+    
+    print("\n--- 4. Comprehensive Backtesting Summary ---")
+    print(final_summary_df.to_markdown(index=False))
+    # --------------------------------------------------------------------------
+    # <<< END NEW >>>
     
     summary_filename = f"{Config.ANALYSIS_DIR}/backtesting_summary_{datetime.now():%Y%m%d_%H%M}.csv"
-    summary_df.to_csv(summary_filename, index=False)
-    print(f"\nSaved backtesting summary to: {summary_filename}")
+    final_summary_df.to_csv(summary_filename, index=False)
+    print(f"\nSaved COMPREHENSIVE backtesting summary to: {summary_filename}")
 
-    # --- 4.3 Generate Diagnostic Plots ---
-    print("\n--- 3. Generating Diagnostic Plots ---")
+    # --- 4.3 Generate Diagnostic Plots (This part remains largely the same) ---
+    print("\n--- 5. Generating Diagnostic Plots ---")
     
-    # Dependence Plots
+    # Dependence Plots (No changes needed, uses the original crisis_periods dict)
     plot_dependence_structure(pit_full_df, tag="full_sample")
-    crisis_periods = {
-        "CovidCrash": ("2020-02-19", "2020-04-07"),
-        "BankingCrisis23": ("2023-03-08", "2023-03-24")
-    }
     for name, (start, end) in crisis_periods.items():
         plot_dependence_structure(pit_full_df, period=(start, end), tag=name)
 
@@ -284,7 +331,7 @@ if __name__ == "__main__":
         plt.plot(ret, label="Portfolio Return", lw=0.8, alpha=0.8)
         plt.plot(var, 'r--', label=f"VaR (alpha={ALPHA})", lw=1)
         plt.scatter(ret.index[breaches], ret[breaches], c="red", s=25, zorder=5, label=f"Breaches: {breaches.sum()}")
-        plt.title(f"{model_to_plot} Copula: Portfolio Return vs. 99% VaR Forecast")
+        plt.title(f"{model_to_plot} Copula: Portfolio Return vs. 99% VaR Forecast (Full Sample)")
         plt.ylabel("Return (%)")
         plt.legend()
         plt.tight_layout()
