@@ -31,7 +31,7 @@ from config import Config
 # ============================================================================ #
 # 1. CONFIGURATION AND HYPERPARAMETER GRID
 # ============================================================================ #
-RUN_OPTUNA_TUNING = False # <<< *** MODIFY THIS SWITCH AS NEEDED ***
+RUN_OPTUNA_TUNING = True # <<< *** MODIFY THIS SWITCH AS NEEDED ***
 
 # --- GARCH Model Specifications ---
 VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
@@ -115,8 +115,66 @@ def estimate_copulas(u_raw: pd.DataFrame, config: dict):
     res = minimize(t_nll, [rhoT_init, 10], bounds=[(-0.99, 0.99), (2.1, 40)], method="L-BFGS-B")
     rhoT, dfT = res.x
 
-    θc = max(0.1, 2 * tau / (1 - tau + 1e-9)) * config['tail_adj']
-    θg = max(1.01, 1 / (1 - tau + 1e-9)) * config['tail_adj']
+    # Initialize
+    theta_init_c = max(0.1, 2 * tau / (1 - tau + 1e-9)) * config['tail_adj']
+    theta_init_g = max(1.01, 1 / (1 - tau + 1e-9)) * config['tail_adj']
+
+    # Negative Log-Likelihood for Clayton Copula
+    def clayton_nll(theta):
+        theta = theta[0]
+        if theta <= 1e-6: return 1e6
+        u1, u2 = u.values[:, 0], u.values[:, 1]
+        
+        # 检查参数约束
+        if np.any(u1**(-theta) + u2**(-theta) - 1 <= 0):
+            return 1e6
+        
+        # 稳定计算
+        term = u1**(-theta) + u2**(-theta) - 1
+        log_pdf = np.log(theta + 1) - (theta+1)*(np.log(u1) + np.log(u2)) - (2 + 1/theta)*np.log(term)
+        if np.any(np.isnan(log_pdf) | np.isinf(log_pdf)):
+            return 1e6
+        return -np.sum(log_pdf)
+
+    # Negative Log-Likelihood for Gumbel Copula (改进版)
+    def gumbel_nll(theta):
+        theta = theta[0]
+        if theta <= 1: return 1e6
+        u1, u2 = u.values[:, 0], u.values[:, 1]
+        
+        # 避免log(0)
+        u1 = np.clip(u1, 1e-6, 1-1e-6)
+        u2 = np.clip(u2, 1e-6, 1-1e-6)
+        log_u1 = -np.log(u1)
+        log_u2 = -np.log(u2)
+        
+        # 稳定计算
+        a = log_u1**theta + log_u2**theta
+        c_val = a**(1/theta)
+        log_pdf = (
+            -c_val 
+            + (theta-1)*(np.log(log_u1) + np.log(log_u2))
+            - np.log(u1*u2)
+            + np.log(c_val + theta - 1)
+            - (2 - 1/theta)*np.log(a)
+        )
+        if np.any(np.isnan(log_pdf) | np.isinf(log_pdf)):
+            return 1e6
+        return -np.sum(log_pdf)
+
+    # MLE优化 (添加优化选项)
+    options = {'maxiter': 1000}
+    res_c = minimize(clayton_nll, [theta_init_c], 
+                    bounds=[(0.01, 20)], 
+                    method='L-BFGS-B', 
+                    options=options)
+    res_g = minimize(gumbel_nll, [theta_init_g], 
+                    bounds=[(1.01, 20)], 
+                    method='L-BFGS-B', 
+                    options=options)
+    
+    θc = res_c.x[0] if res_c.success else theta_init_c
+    θg = res_g.x[0] if res_g.success else theta_init_g
 
     return {
         "Gaussian": {"corr_matrix": np.array([[1, rhoG], [rhoG, 1]]), "rho": rhoG},
@@ -332,8 +390,8 @@ def main():
         def objective(trial):
             config = {
                 "refit_freq": trial.suggest_categorical("refit_freq", [1, 30, 63]),
-                "beta_cap": trial.suggest_float("beta_cap", 0.93, 0.99, step=0.02),
-                "tail_adj": trial.suggest_float("tail_adj", 1.4, 2.0, step=0.2),
+                "beta_cap": trial.suggest_float("beta_cap", 0.9, 1, step=0.02),
+                "tail_adj": trial.suggest_float("tail_adj", 1.1, 2.0, step=0.1),
                 "sims": SIMS_PER_DAY,
                 "alpha": PORTFOLIO_ALPHA,
             }
