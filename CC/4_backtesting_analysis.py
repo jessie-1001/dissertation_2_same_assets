@@ -23,6 +23,7 @@ from scipy import stats
 import warnings
 import matplotlib as mpl
 from datetime import datetime
+import re   
 
 from config import Config
 
@@ -38,6 +39,8 @@ FORECAST_RESULTS_CSV = f"{Config.SIMULATION_DIR}/garch_copula_all_results.csv"
 ACTUAL_RETURNS_CSV = f"{Config.DATA_DIR}/spx_dax_daily_data.csv"
 PIT_DATA_CSV = f"{Config.MODEL_DIR}/copula_input_data_full.csv"
 
+print("All data files loaded successfully.")
+
 # --- Parameters ---
 ALPHA = 0.01  # For 99% VaR / ES
 MODELS_TO_TEST = ("Gaussian", "StudentT", "Clayton", "Gumbel")
@@ -50,6 +53,7 @@ mpl.rcParams.update({
     "axes.unicode_minus": False,
     "figure.dpi": 120
 })
+
 
 # ============================================================================ #
 # 2. STATISTICAL TEST FUNCTIONS (No changes needed here)
@@ -224,6 +228,107 @@ def plot_dependence_structure(pit_df, period=None, tag="full_sample"):
     plt.savefig(f"{Config.ANALYSIS_DIR}/dependence_{tag}.png", dpi=150)
     plt.close()
 
+def multi_level_var_test(forecast_df: pd.DataFrame,
+                         actual_returns: pd.DataFrame,
+                         levels=(0.99, 0.995, 0.999),
+                         models=MODELS_TO_TEST):
+    """
+    • 在多置信水平 (默认 99%、99.5%、99.9%) 下做 VaR 失超率测试  
+    • 需要 forecast_df 中含有每个模型的 1×25 000 模拟 P/L 列  (形如 'Gaussian_SimPL')
+    • 结果 CSV:  <analysis_dir>/multi_level_var.csv
+      图表 PNG:  <analysis_dir>/var_curve_comparison.png
+    """
+    # ---------- 工具：把字符串 / list / ndarray 统一成 float ndarray ----------
+    def _str_to_ndarray(x) -> np.ndarray:
+        """
+        支持：
+          • '[0.01  0.02 …]'   • '[0.01,0.02,…]'  • 带换行 / 科学计数
+          • list / tuple / ndarray / pandas-array
+        解析失败或空串时返回空 ndarray
+        """
+        if isinstance(x, str):
+            # 去掉方括号 & 换行，逗号→空格，连续空格压缩
+            clean = re.sub(r'[\[\]\n]', ' ', x).replace(',', ' ').strip()
+            if not clean:
+                return np.array([], dtype=float)
+            arr = np.fromstring(clean, sep=' ', dtype=float)
+            return arr
+        else:
+            return np.asarray(x, dtype=float)  # list / ndarray / 等
+
+    # ---------- 计算实际组合收益 ----------
+    act = actual_returns.copy()
+    act["Portfolio_Return"] = 0.5*act["SPX_Return"] + 0.5*act["DAX_Return"]
+
+    rows = []
+
+    for model in models:
+        col_sim = f"{model}_SimPL"
+        if col_sim not in forecast_df.columns:
+            print(f"[Warning] {col_sim} missing – skip {model}")
+            continue
+
+        # 对齐日期索引
+        merged = forecast_df[[col_sim]].join(
+            act["Portfolio_Return"], how="inner"
+        ).dropna()
+        if merged.empty:
+            continue
+
+        # 解析字符串 → ndarray；保留索引便于后面对齐
+        sim_series = merged[col_sim].map(_str_to_ndarray)
+
+        for alpha in levels:
+            # 对每日 25 000 跑分布分位；只保留成功解析的那几天
+            VaR_list = []
+            realized_list = []
+
+            for dt, pl in sim_series.items():
+                if pl.size:  # 非空
+                    VaR_list.append(np.percentile(pl, 100*(1-alpha)))
+                    realized_list.append(merged.at[dt, "Portfolio_Return"])
+
+            if not VaR_list:        # 该 alpha 没可用数据
+                continue
+
+            VaR_arr  = np.asarray(VaR_list)
+            real_arr = np.asarray(realized_list)
+
+            breaches = (real_arr < VaR_arr).mean()
+
+            rows.append({
+                "Model"      : model,
+                "ConfLevel"  : alpha,
+                "BreachRate" : breaches,
+                "Expected"   : 1-alpha,
+                "RelError"   : breaches / (1-alpha)
+            })
+
+    # ---------- 输出结果 ----------
+    result_df = pd.DataFrame(rows)
+    if result_df.empty:
+        print("[Info] No multi-level data generated."); return
+
+    out_csv = f"{Config.ANALYSIS_DIR}/multi_level_var.csv"
+    result_df.to_csv(out_csv, index=False)
+    print(f"• Multi-level VaR table saved → {out_csv}")
+
+    # ---------- 绘图 ----------
+    plt.figure(figsize=(8,5))
+    for mdl, grp in result_df.groupby("Model"):
+        plt.plot(grp["Expected"], grp["RelError"], "o-", label=mdl)
+
+    plt.axhline(1, ls="--", color="grey")
+    plt.xscale("log"); plt.yscale("log")
+    plt.xlabel("Expected Breach Probability")
+    plt.ylabel("Relative Error (actual / expected)")
+    plt.title("Multi-level VaR Backtest")
+    plt.legend(); plt.tight_layout()
+
+    out_png = f"{Config.ANALYSIS_DIR}/var_curve_comparison.png"
+    plt.savefig(out_png, dpi=150); plt.close()
+    print(f"• Multi-level VaR plot  saved → {out_png}")
+
 
 # ============================================================================ #
 # 4. MAIN EXECUTION BLOCK
@@ -243,6 +348,12 @@ if __name__ == "__main__":
         print(f"[Error] Could not find a required data file: {e}")
         print("Please ensure scripts 1, 2, and 3 have been run successfully.")
         exit()
+    
+    # === DEBUG: 看看 forecasts_df 里到底有哪些列 =========
+    print(">> First 40 columns in forecasts_df:")
+    print(forecasts_df.columns.tolist()[:40])
+    print("="*60)
+
 
     # Clean timezone info for consistency
     for df in (forecasts_df, actuals_df, pit_full_df):
@@ -356,3 +467,7 @@ if __name__ == "__main__":
     print("=" * 80)
     print(">>> SCRIPT 04 FINISHED <<<")
     print("=" * 80)
+
+    # ===== 新增函数 =====
+    print("\n--- 6. Advanced Tail Risk Analysis ---")
+    multi_level_var_test(forecasts_df, actuals_df)

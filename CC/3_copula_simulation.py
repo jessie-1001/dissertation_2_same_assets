@@ -31,7 +31,7 @@ from config import Config
 # ============================================================================ #
 # 1. CONFIGURATION AND HYPERPARAMETER GRID
 # ============================================================================ #
-RUN_OPTUNA_TUNING = True # <<< *** MODIFY THIS SWITCH AS NEEDED ***
+RUN_OPTUNA_TUNING = False # <<< *** MODIFY THIS SWITCH AS NEEDED ***
 
 # --- GARCH Model Specifications ---
 VOL_FAMILIES = {"GARCH": dict(vol="GARCH", o=0), "GJR": dict(vol="GARCH", o=1)}
@@ -276,25 +276,29 @@ def one_day_forecast(date, full_df, u_df, config, MEAN_SPEC, VOL_FAMILIES):
         w_s, w_d = min_var_w(σs, σd, copulas[name]["rho"])
         u = gen(config['sims'])
 
-        # Use the distribution's own .ppf() method for accurate simulation
         innov_s = dist_s.ppf(u[:, 0], params_s)
         innov_d = dist_d.ppf(u[:, 1], params_d)
 
         ret_s = μs + σs * innov_s
         ret_d = μd + σd * innov_d
-        port = (w_s * ret_s + w_d * ret_d)[np.isfinite(ret_s) & np.isfinite(ret_d)]
-        
-        if port.size < 50: VaR, ES = np.nan, np.nan
+        port   = w_s * ret_s + w_d * ret_d          # shape = (25000,)
+
+        # --- 新增：把整段组合收益存到列表，稍后再塞进 out ---
+        out[f"{name}_SimPL"] = port                 # <<< 关键行
+
+        if port.size < 50:
+            VaR, ES = np.nan, np.nan
         else:
             VaR = np.percentile(port, 100 * config['alpha'])
-            ES = port[port <= VaR].mean()
+            ES  = port[port <= VaR].mean()
 
         out.update({
-            f"{name}_wSPX": w_s, 
-            f"{name}_wDAX": w_d, 
-            f"{name}_VaR": VaR, 
-            f"{name}_ES": ES
+            f"{name}_wSPX": w_s,
+            f"{name}_wDAX": w_d,
+            f"{name}_VaR" : VaR,
+            f"{name}_ES"  : ES
         })
+
     out["Date"] = date
     return out
 
