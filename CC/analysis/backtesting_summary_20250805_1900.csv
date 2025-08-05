@@ -1,0 +1,17 @@
+Market Regime,Model,Observations,Breaches,Expected,Breach Rate,Kupiec p-val,Christoffersen p-val,ES Test Verdict,Annualized Return %,Annualized Vol %,Sharpe Ratio,Performance vs 50/50
+Full Sample,Gaussian,1341,25,13.4,0.0186,0.0045,0.0099,Pass,12.14,18.89,0.643,Better
+Full Sample,StudentT,1341,23,13.4,0.0172,0.0169,0.0608,Pass,12.11,18.91,0.640,Better
+Full Sample,Clayton,1341,21,13.4,0.0157,0.0544,0.0415,Pass,12.06,18.87,0.639,Better
+Full Sample,Gumbel,1341,127,13.4,0.0947,0.0000,0.0726,Reject,12.14,18.89,0.643,Better
+CovidCrash,Gaussian,37,5,0.4,0.1351,0.0000,0.6836,Pass,-167.67,64.80,-2.587,Worse
+CovidCrash,StudentT,37,5,0.4,0.1351,0.0000,0.6836,Pass,-177.77,64.22,-2.768,Worse
+CovidCrash,Clayton,37,5,0.4,0.1351,0.0000,0.6836,Pass,-164.04,65.03,-2.523,Worse
+CovidCrash,Gumbel,37,8,0.4,0.2162,0.0000,0.2584,Marginal,-167.38,64.82,-2.582,Worse
+BankingCrisis23,Gaussian,18,0,0.2,0.0000,1.0000,NA,Too-few,27.60,18.84,1.465,Better
+BankingCrisis23,StudentT,18,0,0.2,0.0000,1.0000,NA,Too-few,30.03,18.80,1.597,Better
+BankingCrisis23,Clayton,18,0,0.2,0.0000,1.0000,NA,Too-few,26.13,18.95,1.379,Better
+BankingCrisis23,Gumbel,18,2,0.2,0.1111,0.0129,0.1385,Too-few,27.45,18.85,1.457,Better
+Non-Crisis,Gaussian,1286,20,12.9,0.0156,0.0642,0.0367,Pass,17.10,15.69,1.090,Better
+Non-Crisis,StudentT,1286,18,12.9,0.0140,0.1743,0.2498,Pass,17.32,15.76,1.099,Better
+Non-Crisis,Clayton,1286,16,12.9,0.0124,0.3966,0.1912,Pass,16.93,15.64,1.083,Better
+Non-Crisis,Gumbel,1286,117,12.9,0.0910,0.0000,0.2774,Reject,17.09,15.68,1.090,Better

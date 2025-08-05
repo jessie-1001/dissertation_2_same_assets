@@ -136,7 +136,6 @@ def es_backtest(realized_returns, es_forecast, var_forecast):
 
 def backtest_all_models(forecasts_df: pd.DataFrame, actuals_df: pd.DataFrame, alpha=ALPHA):
     """Orchestrates the backtesting process for all copula models on a given dataset."""
-    actuals_shifted = actuals_df.shift(-1)
     results = []
 
     for model in MODELS_TO_TEST:
@@ -146,7 +145,7 @@ def backtest_all_models(forecasts_df: pd.DataFrame, actuals_df: pd.DataFrame, al
         if not set(weight_cols + [var_col, es_col]).issubset(forecasts_df.columns):
             continue
 
-        data = pd.concat([forecasts_df[weight_cols + [var_col, es_col]], actuals_shifted[["SPX_Return", "DAX_Return"]]], axis=1).dropna()
+        data = pd.concat([forecasts_df[weight_cols + [var_col, es_col]], actuals_df[["SPX_Return", "DAX_Return"]]], axis=1).dropna()
         if data.empty or len(data) < 15:
             continue
 

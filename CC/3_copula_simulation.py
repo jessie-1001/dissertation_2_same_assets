@@ -365,6 +365,49 @@ def main():
     final_results_path = f"{Config.SIMULATION_DIR}/garch_copula_all_results.parquet"
     final_df.to_parquet(final_results_path)
 
+    # ======================================================================== #
+    # 6. FINAL DESCRIPTIVE PARAMETER ESTIMATION FOR REPORTING
+    # ======================================================================== #
+    print("\n--- Estimating Final Copula Parameters for Paper ---")
+    print(f"Using best config: {best_config}")
+
+    # Use the full history of PITs for a final, descriptive estimation
+    final_full_sample_copulas = estimate_copulas(u_df, best_config)
+
+    # Extract parameters for reporting
+    gauss_rho = final_full_sample_copulas["Gaussian"]["rho"]
+    student_t_rho = final_full_sample_copulas["StudentT"]["rho"]
+    student_t_df = final_full_sample_copulas["StudentT"]["df"]
+    clayton_theta = final_full_sample_copulas["Clayton"]["theta"]
+    gumbel_theta = final_full_sample_copulas["Gumbel"]["theta"]
+
+    # (Optional) Save parameters to a pickle file for future use
+    params_for_report = {
+        "Gaussian_rho": gauss_rho,
+        "StudentT_rho": student_t_rho,
+        "StudentT_df": student_t_df,
+        "Clayton_theta": clayton_theta,
+        "Gumbel_theta": gumbel_theta,
+        "best_tail_adj": best_config.get('tail_adj', 'N/A')
+    }
+    params_path = f"{Config.ANALYSIS_DIR}/final_copula_parameters.pkl"
+    with open(params_path, "wb") as f:
+        pickle.dump(params_for_report, f)
+    print(f"\nSaved final descriptive parameters to: {params_path}")
+
+
+    # --- Print Markdown Table for Paper ---
+    print("\n--- Optimized Copula Parameters (Full Sample, Bayesian Tuning) ---")
+    print(f"| {'Copula Family':<20} | {'Key Parameter':<25} | {'Estimated Value':<20} |")
+    print(f"|:{'-'*19} |:{'-'*24} |:{'-'*19}:|")
+    print(f"| {'Gaussian':<20} | {'Correlation (ρ)':<25} | {gauss_rho:<20.4f} |")
+    print(f"| {'Student-t':<20} | {'Correlation (ρ)':<25} | {student_t_rho:<20.4f} |")
+    print(f"| {'':<20} | {'Degrees of Freedom (ν)':<25} | {student_t_df:<20.2f} |")
+    print(f"| {'Clayton':<20} | {'Dependence (θ)':<25} | {clayton_theta:<20.3f} |")
+    print(f"| {'Survival Gumbel':<20} | {'Dependence (θ)':<25} | {gumbel_theta:<20.3f} |")
+    print(f"Note: Archimedean copula parameters incorporate optimized tail_adj = {best_config.get('tail_adj', 'N/A'):.2f}")
+    # --- End of Markdown Table ---
+
     print(f"\nSaved final tuned forecasts → {final_results_path}")
     print("\n" + "="*80 + "\n>>> Process finished successfully. <<<\n" + "="*80)
 

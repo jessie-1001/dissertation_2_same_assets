@@ -8,8 +8,8 @@ Vol Model:                                  GARCH   Log-Likelihood:             
 Distribution:      Generalized Error Distribution   AIC:                           11444.7
 Method:                        Maximum Likelihood   BIC:                           11475.7
                                                     No. Observations:                 3639
-Date:                            Fri, Aug 01 2025   Df Residuals:                     3638
-Time:                                    01:41:03   Df Model:                            1
+Date:                            Tue, Aug 05 2025   Df Residuals:                     3638
+Time:                                    19:23:09   Df Model:                            1
                                 Mean Model                                
 ==========================================================================
                  coef    std err          t      P>|t|    95.0% Conf. Int.
