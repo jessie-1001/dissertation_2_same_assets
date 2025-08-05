@@ -264,8 +264,21 @@ def run_simulation_for_config(dates_to_forecast, full_df, u_df, config):
             innov_s, innov_d = dist_s.ppf(u_sim[:, 0], params_s), dist_d.ppf(u_sim[:, 1], params_d)
             ret_s, ret_d = μs + σs * innov_s, μd + σd * innov_d
             port_pl = w_s * ret_s + w_d * ret_d
-            VaR, ES = np.percentile(port_pl, 100 * config['alpha']), port_pl[port_pl <= np.percentile(port_pl, 100 * config['alpha'])].mean()
-            day_out.update({f"{name}_wSPX": w_s, f"{name}_wDAX": w_d, f"{name}_VaR": VaR, f"{name}_ES": ES, f"{name}_SimPL": port_pl})
+            var_990 = np.percentile(port_pl, 1)
+            es_990 = port_pl[port_pl <= var_990].mean()
+
+            # Pre-calculate other levels needed for multi_level_var_test
+            var_995 = np.percentile(port_pl, 0.5)
+            var_999 = np.percentile(port_pl, 0.1)
+
+            day_out.update({
+                f"{name}_wSPX": w_s, f"{name}_wDAX": w_d,
+                f"{name}_VaR_990": var_990, # Renamed for clarity
+                f"{name}_ES_990": es_990,   # Renamed for clarity
+                f"{name}_VaR_995": var_995,
+                f"{name}_VaR_999": var_999,
+                # The massive _SimPL column is no longer saved
+            })
         all_forecasts.append(day_out)
         
     return pd.DataFrame(all_forecasts).set_index("Date").sort_index()

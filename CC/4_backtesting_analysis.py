@@ -141,7 +141,7 @@ def backtest_all_models(forecasts_df: pd.DataFrame, actuals_df: pd.DataFrame, al
 
     for model in MODELS_TO_TEST:
         weight_cols = [f"{model}_wSPX", f"{model}_wDAX"]
-        var_col, es_col = f"{model}_VaR", f"{model}_ES"
+        var_col, es_col = f"{model}_VaR_990", f"{model}_ES_990"
 
         if not set(weight_cols + [var_col, es_col]).issubset(forecasts_df.columns):
             continue
@@ -200,41 +200,27 @@ def plot_dependence_structure(pit_df, period=None, tag="full_sample"):
 
 def multi_level_var_test(forecast_df: pd.DataFrame,
                          actual_returns: pd.DataFrame,
-                         levels=(0.99, 0.995, 0.999),
+                         levels={'VaR_990': 0.01, 'VaR_995': 0.005, 'VaR_999': 0.001},
                          models=MODELS_TO_TEST):
-    """Performs VaR breach rate tests at multiple confidence levels using full simulation data."""
-    # This parser is no longer needed thanks to Parquet file format.
-    # def _str_to_ndarray(x) -> np.ndarray: ...
-    
+    """Performs VaR breach rate tests at multiple levels using pre-calculated VaR columns."""
     act = actual_returns.copy()
-    # Note: Using 50/50 weights for this test for consistent comparison across models
     act["Portfolio_Return"] = 0.5 * act["SPX_Return"] + 0.5 * act["DAX_Return"]
     rows = []
 
     for model in models:
-        col_sim = f"{model}_SimPL"
-        if col_sim not in forecast_df.columns:
-            continue
+        for var_suffix, alpha in levels.items():
+            var_col = f"{model}_{var_suffix}"
+            if var_col not in forecast_df.columns:
+                continue
 
-        merged = forecast_df[[col_sim]].join(act["Portfolio_Return"], how="inner").dropna()
-        if merged.empty:
-            continue
+            # Join to align forecast with actual return for that day
+            merged = forecast_df[[var_col]].join(act["Portfolio_Return"], how="inner").dropna()
+            if merged.empty:
+                continue
 
-        # Data is already an array, no parsing needed.
-        sim_series = merged[col_sim]
-
-        for conf_level in levels:
-            alpha = 1 - conf_level
-            VaR_list = [np.percentile(pl, 100 * alpha) for pl in sim_series if pl.size > 0]
-            if not VaR_list: continue
+            breaches = (merged["Portfolio_Return"] < merged[var_col]).mean()
+            conf_level = 1 - alpha
             
-            # Align realized returns with the days we have valid VaR forecasts
-            realized_list = merged.loc[sim_series.apply(lambda x: x.size > 0), "Portfolio_Return"]
-
-            VaR_arr  = np.asarray(VaR_list)
-            real_arr = np.asarray(realized_list)
-            breaches = (real_arr < VaR_arr).mean()
-
             rows.append({
                 "Model": model, "ConfLevel": conf_level, "BreachRate": breaches,
                 "Expected": alpha, "RelError": breaches / alpha if alpha > 0 else 0
@@ -248,18 +234,17 @@ def multi_level_var_test(forecast_df: pd.DataFrame,
     result_df.to_csv(out_csv, index=False)
     print(f"• Multi-level VaR table saved → {out_csv}")
 
+    # Plotting logic remains the same
     plt.figure(figsize=(8, 5))
     for mdl, grp in result_df.groupby("Model"):
         plt.plot(grp["Expected"], grp["RelError"], "o-", label=mdl)
-
     plt.axhline(1, ls="--", color="grey")
     plt.xscale("log"); plt.yscale("log")
-    plt.gca().invert_xaxis() # Probabilities are easier to read from right to left
+    plt.gca().invert_xaxis()
     plt.xlabel("Expected Breach Probability (α)")
     plt.ylabel("Relative Error (Actual / Expected)")
     plt.title("Multi-Level VaR Backtest")
     plt.legend(); plt.tight_layout()
-
     out_png = f"{Config.ANALYSIS_DIR}/var_curve_comparison.png"
     plt.savefig(out_png, dpi=150); plt.close()
     print(f"• Multi-level VaR plot saved → {out_png}")
@@ -334,7 +319,7 @@ if __name__ == "__main__":
     model_to_plot = "StudentT"
     if f"{model_to_plot}_VaR" in forecasts_df.columns:
         w_cols = [f"{model_to_plot}_wSPX", f"{model_to_plot}_wDAX"]
-        var_col = f"{model_to_plot}_VaR"
+        var_col = f"{model_to_plot}_VaR_990"
         
         tmp = pd.concat([forecasts_df[[var_col] + w_cols], actuals_df.shift(-1)], axis=1).dropna()
         ret = tmp["SPX_Return"] * tmp[w_cols[0]] + tmp["DAX_Return"] * tmp[w_cols[1]]
