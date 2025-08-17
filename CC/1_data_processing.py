@@ -10,41 +10,34 @@ extreme-move detection, outputs CSV + diagnostic plots.
 
 import os
 from typing import Tuple
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import jarque_bera
-
 from config import Config
 
-# ------------------------------ CONFIG SECTION ------------------------------ #
-# Define output file paths using the central config
 OUTPUT_CSV              = os.path.join(Config.DATA_DIR, "spx_dax_daily_data.csv")
 EXTREME_EVENTS_CSV      = os.path.join(Config.DATA_DIR, "extreme_return_events.csv")
 OVERVIEW_PNG            = os.path.join(Config.DATA_DIR, "price_return_overview.png")
 EXTREME_RETURNS_PNG     = os.path.join(Config.DATA_DIR, "extreme_returns.png")
 
-# Other script-specific settings
 START_DATE = "2007-01-01"
 END_DATE = "2025-06-01"
 TICKERS = ["^GSPC", "^GDAXI"]
 
-THRESHOLD_MODE          = "dual"    # "fixed"  or "dual"
-FIXED_PCT               = 5         # 5  ->  ±5%
-K_SIGMA                 = 3         # used when THRESHOLD_MODE="dual"
-SHOW_GAP_SUMMARY        = True      # list multi-day data gaps?
-DRAW_THRESHOLD_LINES    = True      # draw ±threshold on plots?
-# ---------------------------------------------------------------------------- #
+THRESHOLD_MODE          = "dual"
+FIXED_PCT               = 5
+K_SIGMA                 = 3
+SHOW_GAP_SUMMARY        = True
+DRAW_THRESHOLD_LINES    = True
 
 os.makedirs(Config.DATA_DIR, exist_ok=True)
 
-# -----------------------------------------------------------------------------
 
 def download_prices() -> pd.DataFrame:
-    print(f"Downloading {TICKERS} from {START_DATE} to {END_DATE} …")
+    print(f"Downloading {TICKERS} from {START_DATE} to {END_DATE} ")
     close = (
         yf.download(
             TICKERS,
@@ -74,7 +67,6 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
     desc["Jarque_Bera"] = [jb_spx.statistic, jb_dax.statistic]
     desc["JB_p_value"]  = [jb_spx.pvalue,     jb_dax.pvalue]
 
-    # Format for printing
     printable = (
         desc[
             [
@@ -102,7 +94,7 @@ def descriptive_stats(returns: pd.DataFrame) -> None:
     )
 
     print("\n" + "=" * 80)
-    print(">>> DESCRIPTIVE STATISTICS: SPX & DAX RETURNS <<<\n")
+    print("DESCRIPTIVE STATISTICS: SPX & DAX RETURNS\n")
     print(printable.to_markdown(floatfmt=".4f"))
     print("=" * 80 + "\n")
 
@@ -115,7 +107,7 @@ def gap_summary(full_index: pd.DatetimeIndex) -> None:
     if gaps.empty:
         print("No multi-day gaps detected.")
         return
-    print("\n--- Data Gaps ---")
+    print("\n Data Gaps")
     gap_tbl = gaps.value_counts().rename_axis("Gap Size (days)").to_frame("Count")
     print(gap_tbl.to_markdown())
 
@@ -147,12 +139,11 @@ def overview_plot(close: pd.DataFrame, returns: pd.DataFrame) -> None:
     plt.tight_layout()
     plt.savefig(OVERVIEW_PNG)
     plt.close()
-    print(f"• Overview plot saved → {OVERVIEW_PNG}")
+    print(f"Overview plot saved {OVERVIEW_PNG}")
 
 def detect_extremes(
     returns: pd.DataFrame,
 ) -> Tuple[pd.Series, pd.Series, float, float]:
-    """Return cond_spx, cond_dax boolean Series + thresholds."""
     thr_spx = K_SIGMA * returns["SPX_Return"].std()
     thr_dax = K_SIGMA * returns["DAX_Return"].std()
 
@@ -237,14 +228,14 @@ def extreme_plot(
     plt.tight_layout()
     plt.savefig(EXTREME_RETURNS_PNG)
     plt.close()
-    print(f"• Extreme-return plot saved → {EXTREME_RETURNS_PNG}")
+    print(f"Extreme-return plot saved -> {EXTREME_RETURNS_PNG}")
 
 def main() -> None:
     close = download_prices()
     returns = compute_returns(close)
     full = pd.concat([close, returns], axis=1).dropna()
     full.to_csv(OUTPUT_CSV)
-    print(f"• Cleaned data saved → {OUTPUT_CSV}")
+    print(f"Cleaned data saved -> {OUTPUT_CSV}")
     descriptive_stats(returns)
 
     gap_summary(full.index)
@@ -256,9 +247,9 @@ def main() -> None:
     events["Extreme_SPX"] = cond_spx.loc[events.index]
     events["Extreme_DAX"] = cond_dax.loc[events.index]
     events.to_csv(EXTREME_EVENTS_CSV)
-    print(f"• Extreme-event table saved → {EXTREME_EVENTS_CSV}")
+    print(f"Extreme-event table saved -> {EXTREME_EVENTS_CSV}")
     print(
-        f"  > Extreme counts | SPX: {cond_spx.sum()}  DAX: {cond_dax.sum()} "
+        f"  Extreme counts | SPX: {cond_spx.sum()}  DAX: {cond_dax.sum()} "
         f"(mode = {THRESHOLD_MODE})"
     )
 
@@ -268,4 +259,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

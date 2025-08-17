@@ -87,8 +87,8 @@ def gumbel_copula(n, theta):
     v = np.exp(-np.power(e[:, 1], beta) / s)
     return np.column_stack((u, v)).clip(1e-6, 1 - 1e-6)
 
-def surv_gumbel(n, θ):
-    u, v = gumbel_copula(n, θ).T
+def surv_gumbel(n, theta):
+    u, v = gumbel_copula(n, theta).T
     return np.column_stack((1 - u, 1 - v))
 
 def estimate_copulas(u_raw: pd.DataFrame, config: dict):
@@ -103,12 +103,12 @@ def estimate_copulas(u_raw: pd.DataFrame, config: dict):
     rhoT_init = np.sin(np.pi * tau / 2)
 
     def t_nll(p):
-        ρ, ν = p
-        if abs(ρ) >= 0.999: return 1e9
-        L = _safe_chol(np.array([[1, ρ], [ρ, 1]]))
-        z_t = t.ppf(u.values, df=ν)
+        rho, nu = p
+        if abs(rho) >= 0.999: return 1e9
+        L = _safe_chol(np.array([[1, rho], [rho, 1]]))
+        z_t = t.ppf(u.values, df=nu)
         q = np.linalg.solve(L, z_t.T).T
-        ll = t.logpdf(q, df=ν).sum(axis=1) - np.log(np.diag(L)).sum() * 2
+        ll = t.logpdf(q, df=nu).sum(axis=1) - np.log(np.diag(L)).sum() * 2
         return -ll.sum()
 
     res_t = minimize(t_nll, [rhoT_init, 10], bounds=[(-0.99, 0.99), (2.1, 40)], method="L-BFGS-B")
@@ -145,14 +145,14 @@ def estimate_copulas(u_raw: pd.DataFrame, config: dict):
     res_c = minimize(clayton_nll, [theta_init_c], bounds=[(0.01, 20)], method='L-BFGS-B')
     res_g = minimize(gumbel_nll, [theta_init_g], bounds=[(1.01, 20)], method='L-BFGS-B')
 
-    θc = res_c.x[0] if res_c.success else theta_init_c
-    θg = res_g.x[0] if res_g.success else theta_init_g
+    theta_c = res_c.x[0] if res_c.success else theta_init_c
+    theta_g = res_g.x[0] if res_g.success else theta_init_g
 
     return {
         "Gaussian": {"corr_matrix": np.array([[1, rhoG], [rhoG, 1]]), "rho": rhoG},
         "StudentT": {"corr_matrix": np.array([[1, rhoT], [rhoT, 1]]), "df": dfT, "rho": rhoT},
-        "Clayton": {"theta": θc, "rho": np.sin(np.pi * (θc / (θc + 2)) / 2)},
-        "Gumbel": {"theta": θg, "rho": np.sin(np.pi * (1 - 1 / θg) / 2)},
+        "Clayton": {"theta": theta_c, "rho": np.sin(np.pi * (theta_c / (theta_c + 2)) / 2)},
+        "Gumbel": {"theta": theta_g, "rho": np.sin(np.pi * (1 - 1 / theta_g) / 2)},
     }
 
 # ============================================================================ #
@@ -246,8 +246,8 @@ def run_simulation_for_config(dates_to_forecast, full_df, u_df, config):
 
         fc_s = cached_garch_s.forecast(horizon=1, reindex=False)
         fc_d = cached_garch_d.forecast(horizon=1, reindex=False)
-        μs, σs = fc_s.mean.iloc[0, 0], np.sqrt(fc_s.variance.iloc[0, 0])
-        μd, σd = fc_d.mean.iloc[0, 0], np.sqrt(fc_d.variance.iloc[0, 0])
+        mu_s, sigma_s = fc_s.mean.iloc[0, 0], np.sqrt(fc_s.variance.iloc[0, 0])
+        mu_d, sigma_d = fc_d.mean.iloc[0, 0], np.sqrt(fc_d.variance.iloc[0, 0])
         dist_s, params_s = cached_garch_s.model.distribution, cached_garch_s.params[cached_garch_s.model.distribution.parameter_names()].values
         dist_d, params_d = cached_garch_d.model.distribution, cached_garch_d.params[cached_garch_d.model.distribution.parameter_names()].values
 
@@ -259,10 +259,10 @@ def run_simulation_for_config(dates_to_forecast, full_df, u_df, config):
         }
         day_out = {"Date": date}
         for name, gen in samplers.items():
-            w_s, w_d = min_var_w(σs, σd, cached_copulas[name]["rho"])
+            w_s, w_d = min_var_w(sigma_s, sigma_d, cached_copulas[name]["rho"])
             u_sim = gen(config['sims'])
             innov_s, innov_d = dist_s.ppf(u_sim[:, 0], params_s), dist_d.ppf(u_sim[:, 1], params_d)
-            ret_s, ret_d = μs + σs * innov_s, μd + σd * innov_d
+            ret_s, ret_d = mu_s + sigma_s * innov_s, mu_d + sigma_d * innov_d
             port_pl = w_s * ret_s + w_d * ret_d
             var_990 = np.percentile(port_pl, 1)
             es_990 = port_pl[port_pl <= var_990].mean()
@@ -400,11 +400,11 @@ def main():
     print("\n--- Optimized Copula Parameters (Full Sample, Bayesian Tuning) ---")
     print(f"| {'Copula Family':<20} | {'Key Parameter':<25} | {'Estimated Value':<20} |")
     print(f"|:{'-'*19} |:{'-'*24} |:{'-'*19}:|")
-    print(f"| {'Gaussian':<20} | {'Correlation (ρ)':<25} | {gauss_rho:<20.4f} |")
-    print(f"| {'Student-t':<20} | {'Correlation (ρ)':<25} | {student_t_rho:<20.4f} |")
-    print(f"| {'':<20} | {'Degrees of Freedom (ν)':<25} | {student_t_df:<20.2f} |")
-    print(f"| {'Clayton':<20} | {'Dependence (θ)':<25} | {clayton_theta:<20.3f} |")
-    print(f"| {'Survival Gumbel':<20} | {'Dependence (θ)':<25} | {gumbel_theta:<20.3f} |")
+    print(f"| {'Gaussian':<20} | {'Correlation (rho)':<25} | {gauss_rho:<20.4f} |")
+    print(f"| {'Student-t':<20} | {'Correlation (rho)':<25} | {student_t_rho:<20.4f} |")
+    print(f"| {'':<20} | {'Degrees of Freedom (nu)':<25} | {student_t_df:<20.2f} |")
+    print(f"| {'Clayton':<20} | {'Dependence (theta)':<25} | {clayton_theta:<20.3f} |")
+    print(f"| {'Survival Gumbel':<20} | {'Dependence (theta)':<25} | {gumbel_theta:<20.3f} |")
     print(f"Note: Archimedean copula parameters incorporate optimized tail_adj = {best_config.get('tail_adj', 'N/A'):.2f}")
     # --- End of Markdown Table ---
 
